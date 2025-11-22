@@ -146,7 +146,7 @@ const NoFiChat: React.FC = () => {
       setSignalStrength(Math.floor(normalizedLevel));
       
       animationFrameRef.current = requestAnimationFrame(updateLevel);
-    };
+    }; 
     
     updateLevel();
   };
