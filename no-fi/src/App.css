@@ -1,0 +1,9 @@
+/* Reset App-specific styles to allow full-screen chat */
+#root {
+  width: 100%;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  max-width: none;
+  text-align: left;
+}
