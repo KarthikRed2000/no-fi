@@ -32,30 +32,31 @@ interface Log {
 // -- AUDIO PROTOCOL CONSTANTS --
 // -- AUDIO PROTOCOL CONSTANTS --
 // -- AUDIO PROTOCOL CONSTANTS (TUNED) --
+// -- AUDIO PROTOCOL CONSTANTS (FAST MODE) --
 const PROTOCOL = {
-  // Physics
-  FFT_SIZE: 2048,
-  THRESHOLD: 20,
-  RANGE: 100,             
+  // Physics (Faster Scanning)
+  FFT_SIZE: 1024,         // ~21ms per frame (Fast response)
+  THRESHOLD: 25,          // Sensitivity (10-30 range)
+  RANGE: 100,             // +/- 100Hz tolerance
   
-  // Timing
-  TONE_DURATION: 0.25,
-  GAP_DURATION: 0.05,
-  SILENCE_TIMEOUT: 2000,
+  // Timing (The Speed Boost)
+  TONE_DURATION: 0.12,    // 120ms per character
+  GAP_DURATION: 0.04,     // 40ms silence
+  SILENCE_TIMEOUT: 1000,  // 1s silence = Done
   
-  // Frequencies
-  STEP_FREQ: 100,         // Keep 100 for Audible (Reliability)
+  // Frequencies (Tighter packing)
+  STEP_FREQ: 60,
   
   // Modes
   MODES: {
     AUDIBLE: { 
-        MARKER: 1000, 
-        BASE: 1400 
+        MARKER: 2000, 
+        BASE: 2200    // Start at 2.2kHz
     }, 
     STEALTH: { 
-        MARKER: 16000,    // Lowered to fit in bandwidth
-        BASE: 16500,      // Start data at 16.5kHz
-        STEP_FREQ: 40     // Tighten step to 40Hz to fit all letters under 21kHz
+        MARKER: 16000, 
+        BASE: 16500,
+        STEP_FREQ: 40 // Keep stealth tighter to fit bandwidth
     }
   }
 };
@@ -275,10 +276,13 @@ const NoFiChat: React.FC = () => {
     let startTime = now + 0.1;
 
     for (let i = 0; i < text.length; i++) {
+      const currentStep = isStealthModeRef.current ? 40 : PROTOCOL.STEP_FREQ;
       const charCode = text.charCodeAt(i);
+      const freq = mode.BASE + (charCode * currentStep); // Use currentStep
+      // const charCode = text.charCodeAt(i);
       // Inside the for loop...
-      const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
-      const freq = mode.BASE + (charCode * step);
+      // const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
+      // const freq = mode.BASE + (charCode * step);
       // const freq = mode.BASE + (charCode * PROTOCOL.STEP_FREQ);
 
       // Marker Tone
@@ -409,16 +413,18 @@ const NoFiChat: React.FC = () => {
 
       // Calculate Character
       // freq = BASE + (char * STEP)  -->  char = (freq - BASE) / STEP
-      const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
-      const rawChar = (freq - mode.BASE) / step;
+      // const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
+      // const rawChar = (freq - mode.BASE) / step;
+      const currentStep = isStealthModeRef.current ? 40 : PROTOCOL.STEP_FREQ;
+      const rawChar = (freq - mode.BASE) / currentStep; // Use currentStep
       // const rawChar = (freq - mode.BASE) / PROTOCOL.STEP_FREQ;
       const estimatedChar = Math.round(rawChar);
       
       // Check if valid ASCII (Space to Tilde)
       if (estimatedChar >= 32 && estimatedChar <= 126) {
          // Check if the frequency is actually close to the expected center
-         const expectedFreq = mode.BASE + (estimatedChar * step);
-         if (Math.abs(freq - expectedFreq) < (step / 2)) { // Tighten tolerance for stealth
+         const expectedFreq = mode.BASE + (estimatedChar * currentStep);
+         if (Math.abs(freq - expectedFreq) < (currentStep / 2)) {
              
              d.consecutiveFrames++;
              // Require 3 frames to confirm character
