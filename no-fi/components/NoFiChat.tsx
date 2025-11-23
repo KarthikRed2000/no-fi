@@ -25,16 +25,34 @@ interface RelayMessage {
 }
 
 const PROTOCOL = {
-  MARKER_FREQ: 1200,
-  BASE_FREQ: 1500,
-  STEP_FREQ: 40,
-  TONE_DURATION: 0.08,
-  GAP_DURATION: 0.02,
+  // Physics
   FFT_SIZE: 2048,
-  THRESHOLD: 30,
-  SILENCE_TIMEOUT: 1500,
+  THRESHOLD: 20,
+  RANGE: 100,             
+
   IDLE_TIMEOUT: 3000,
-  SEPARATOR: '|'
+  SEPARATOR: '|',
+  
+  // Timing
+  TONE_DURATION: 0.25,
+  GAP_DURATION: 0.05,
+  SILENCE_TIMEOUT: 2000,
+  
+  // Frequencies
+  STEP_FREQ: 100,         // Keep 100 for Audible (Reliability)
+  
+  // Modes
+  MODES: {
+    AUDIBLE: { 
+        MARKER: 1000, 
+        BASE: 1400 
+    }, 
+    STEALTH: { 
+        MARKER: 16000,    // Lowered to fit in bandwidth
+        BASE: 16500,      // Start data at 16.5kHz
+        STEP_FREQ: 40     // Tighten step to 40Hz to fit all letters under 21kHz
+    }
+  }
 };
 
 const NoFiChat: React.FC = () => {
@@ -250,7 +268,6 @@ const NoFiChat: React.FC = () => {
 
   const transmitAudio = (payload: string, onComplete?: () => void) => {
     if (!audioContextRef.current) return;
-    
     const ctx = audioContextRef.current;
     
     if (ctx.state === 'suspended') ctx.resume();
@@ -259,26 +276,36 @@ const NoFiChat: React.FC = () => {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
+    // Use the Ref to determine mode
+    const mode = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH : PROTOCOL.MODES.AUDIBLE;
+
     osc.connect(gain);
     gain.connect(ctx.destination);
 
     gain.gain.setValueAtTime(0, now);
     let startTime = now + 0.1;
 
-    for (let i = 0; i < payload.length; i++) {
-      const charCode = payload.charCodeAt(i);
-      const freq = PROTOCOL.BASE_FREQ + (charCode * PROTOCOL.STEP_FREQ);
+    for (let i = 0; i < text.length; i++) {
+      const charCode = text.charCodeAt(i);
+      // Inside the for loop...
+      const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
+      const freq = mode.BASE + (charCode * step);
+      // const freq = mode.BASE + (charCode * PROTOCOL.STEP_FREQ);
 
-      osc.frequency.setValueAtTime(PROTOCOL.MARKER_FREQ, startTime);
+      // Marker Tone
+      osc.frequency.setValueAtTime(mode.MARKER, startTime);
       gain.gain.setValueAtTime(0.5, startTime);
       gain.gain.setValueAtTime(0.5, startTime + PROTOCOL.TONE_DURATION);
-      gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.005); 
+      gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.01); 
+
       startTime += PROTOCOL.TONE_DURATION + PROTOCOL.GAP_DURATION;
 
+      // Data Tone
       osc.frequency.setValueAtTime(freq, startTime);
       gain.gain.setValueAtTime(0.5, startTime);
       gain.gain.setValueAtTime(0.5, startTime + PROTOCOL.TONE_DURATION);
-      gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.005);
+      gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.01);
+
       startTime += PROTOCOL.TONE_DURATION + PROTOCOL.GAP_DURATION;
     }
 
@@ -292,8 +319,12 @@ const NoFiChat: React.FC = () => {
     };
   };
 
+  // -- RECEIVER LOOP --
   const startAudioMonitoring = (): void => {
     if (!analyserRef.current || !audioContextRef.current) return;
+    
+    // CRITICAL: Set FFT Size to match Protocol
+    analyserRef.current.fftSize = PROTOCOL.FFT_SIZE;
     
     const bufferLength = analyserRef.current.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
@@ -309,10 +340,8 @@ const NoFiChat: React.FC = () => {
       let maxIndex = 0;
 
       for (let i = 0; i < bufferLength; i++) {
-        const val = dataArray[i];
-        sum += val;
-        if (val > maxVal) {
-          maxVal = val;
+        if (dataArray[i] > maxVal) {
+          maxVal = dataArray[i];
           maxIndex = i;
         }
       }
@@ -342,7 +371,11 @@ const NoFiChat: React.FC = () => {
   const handleFrequencyInput = (freq: number, amplitude: number) => {
     const d = decoderRef.current;
     const now = Date.now();
+    
+    // Get Frequencies
+    const mode = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH : PROTOCOL.MODES.AUDIBLE;
 
+    // 1. Timeout Check
     if (d.buffer.length > 0 && (now - d.lastCharDecoded > 3000)) {
       addLog('No new char for 3s - committing', 'info');
       commitReceivedMessage();
@@ -379,46 +412,68 @@ const NoFiChat: React.FC = () => {
 
     const isFreq = (target: number, range = 50) => Math.abs(freq - target) < range;
 
+    // --- STATE 1: WAITING FOR MARKER ---
     if (d.state === 'IDLE' || d.state === 'WAIT_MARKER') {
-      if (isFreq(PROTOCOL.MARKER_FREQ)) {
+      if (isFreq(mode.MARKER)) {
         d.consecutiveFrames++;
-        if (d.consecutiveFrames > 2) { 
+        // Require 3 frames (~120ms) to confirm marker
+        if (d.consecutiveFrames >= 3) { 
+          console.log("START MARKER DETECTED"); // Debug
           d.state = 'READ_CHAR';
           d.consecutiveFrames = 0;
           d.lastDetectedChar = null;
           d.lastValidRead = now;
           if (!isReceiving) setIsReceiving(true);
+          if (d.buffer.length > 0) d.silenceTimer = now; // Keep alive
         }
       } else {
         d.consecutiveFrames = 0;
       }
     } 
+    // --- STATE 2: READING CHARACTER ---
     else if (d.state === 'READ_CHAR') {
-      if (!isFreq(PROTOCOL.MARKER_FREQ)) {
-        const estimatedChar = Math.round((freq - PROTOCOL.BASE_FREQ) / PROTOCOL.STEP_FREQ);
-        
-        if (estimatedChar >= 32 && estimatedChar <= 126) {
-           d.consecutiveFrames++;
-           
-           if (d.consecutiveFrames > 3) {
-             const char = String.fromCharCode(estimatedChar);
-             
-             if (char !== d.lastDetectedChar) {
-               d.buffer += char;
-               setIncomingBuffer(d.buffer);
-               d.lastDetectedChar = char;
-               d.lastCharDecoded = now;
-               d.state = 'WAIT_MARKER'; 
-               d.consecutiveFrames = 0;
-               d.lastValidRead = now;
-             }
-           }
-        } else {
-          d.consecutiveFrames = 0;
-        }
-      } else {
-         d.consecutiveFrames = 0;
+      // If we see the marker again, ignore it (it's just the gap or long beep)
+      if (isFreq(mode.MARKER)) {
+        d.consecutiveFrames = 0;
+        return;
       }
+
+      // Calculate Character
+      // freq = BASE + (char * STEP)  -->  char = (freq - BASE) / STEP
+      const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
+      const rawChar = (freq - mode.BASE) / step;
+      // const rawChar = (freq - mode.BASE) / PROTOCOL.STEP_FREQ;
+      const estimatedChar = Math.round(rawChar);
+      
+      // Check if valid ASCII (Space to Tilde)
+      if (estimatedChar >= 32 && estimatedChar <= 126) {
+         // Check if the frequency is actually close to the expected center
+         const expectedFreq = mode.BASE + (estimatedChar * step);
+         if (Math.abs(freq - expectedFreq) < (step / 2)) { // Tighten tolerance for stealth
+             
+             d.consecutiveFrames++;
+             // Require 3 frames to confirm character
+             if (d.consecutiveFrames >= 3) {
+               const char = String.fromCharCode(estimatedChar);
+               
+               if (char !== d.lastDetectedChar) {
+                 console.log("CHAR DETECTED:", char); // Debug
+                 d.buffer += char;
+                 setIncomingBuffer(d.buffer); 
+                 d.lastDetectedChar = char;
+                 d.lastCharDecoded = now;
+                 d.state = 'WAIT_MARKER'; 
+                 d.consecutiveFrames = 0;
+                 d.lastValidRead = now;
+                 d.silenceTimer = now;
+               }
+             }
+         } else {
+          d.consecutiveFrames = 0;
+      }
+    } else {
+         d.consecutiveFrames = 0;
+    }
     }
   };
 
@@ -482,6 +537,21 @@ const NoFiChat: React.FC = () => {
       if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(track => track.stop());
     };
   }, []);
+
+  // -- STEALTH MODE STATE --
+  // 1. The State (Updates the UI Button)
+  const [isStealthMode, setIsStealthMode] = useState<boolean>(false);
+  
+  // 2. The Ref (Updates the Audio Engine instantly)
+  const isStealthModeRef = useRef<boolean>(false);
+
+  // 3. The Toggle Function (Syncs both)
+  const toggleStealthMode = () => {
+    const newMode = !isStealthMode;
+    setIsStealthMode(newMode);          // Update UI
+    isStealthModeRef.current = newMode; // Update Audio Engine
+    addLog(`Switched to ${newMode ? 'STEALTH' : 'AUDIBLE'} mode`, 'info');
+  };
 
   // 1. LOAD WHISPER MODEL (Runs once on mount)
   // 1. LOAD WHISPER MODEL
@@ -1143,6 +1213,58 @@ const NoFiChat: React.FC = () => {
                 </div>
               </div>
             </div>
+          </div>
+          {/* RIGHT SIDE CONTROLS */}
+          <div className="flex items-center gap-3">
+            
+            {/* --- NEW: STEALTH TOGGLE BUTTON --- */}
+            <button
+              onClick={toggleStealthMode}
+              className={`
+                hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold border transition-all
+                ${isStealthMode 
+                  ? 'bg-red-900/80 border-red-500 text-red-200 animate-pulse shadow-[0_0_15px_rgba(239,68,68,0.5)]' 
+                  : 'bg-black/20 border-white/10 text-blue-200 hover:bg-black/40'}
+              `}
+              title="Switch between Audible (1.2kHz) and Stealth (18.5kHz)"
+            >
+              {isStealthMode ? (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
+                  STEALTH
+                </>
+              ) : (
+                <>
+                  <Signal className="w-3 h-3" />
+                  AUDIBLE
+                </>
+              )}
+            </button>
+            {/* ---------------------------------- */}
+
+            {/* Signal Meter (Existing Code) */}
+            <div className="text-right hidden sm:block">
+              <div className="text-xs text-blue-100">FREQ</div>
+              <div className="text-sm font-bold text-white font-mono">{signalStrength > 10 ? 'DETECT' : 'LOW'}</div>
+            </div>
+            {/* Visualizer (Existing Code) */}
+            <div className="w-24 sm:w-32 h-8 bg-black/40 rounded flex items-end justify-between px-1 pb-1 gap-0.5 border border-white/10">
+              {[...Array(8)].map((_, i) => (
+                <div 
+                  key={i}
+                  className="w-full bg-cyan-400 rounded-t-sm transition-all duration-75"
+                  style={{ 
+                    height: `${Math.min(100, Math.max(10, audioLevel * (1 + Math.sin(i + Date.now()/100)) ))}%`,
+                    opacity: micPermission ? 1 : 0.3
+                  }} 
+                />
+              ))}
+            </div>
+            {micPermission ? (
+              <Mic className={`w-6 h-6 ${isReceiving ? 'text-green-400 animate-pulse' : 'text-blue-300'}`} />
+            ) : (
+              <MicOff className="w-6 h-6 text-red-400" />
+            )}
           </div>
         </div>
 
