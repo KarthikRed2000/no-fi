@@ -562,19 +562,17 @@ const NoFiChat: React.FC = () => {
   useEffect(() => {
     const loadModel = async () => {
       try {
-        addLog("Loading AI engine...", "info");
         
         // @ts-ignore
         const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
         
         env.allowLocalModels = false; 
         
-        addLog("Downloading model weights (~40MB)...", "info");
         const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
         
         setTranscriber(() => pipe); 
         setIsModelLoading(false);
-        addLog("Offline AI Ready! (WiFi can now be turned off)", "success");
+        addLog("Offline AI Ready!", "success");
 
       } catch (err) {
         console.error(err);
