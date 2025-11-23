@@ -147,7 +147,8 @@ const NoFiChat: React.FC = () => {
     lastValidRead: Date.now(),
     lastCharDecoded: Date.now(),
     consecutiveFrames: 0,
-    lastFreqIndex: 0
+    // NEW: Track which mode we detected for the current packet
+    activeMode: 'AUDIBLE' as 'AUDIBLE' | 'STEALTH' 
   });
 
   const generateId = () => Math.random().toString(36).substring(2, 6).toUpperCase();
@@ -371,6 +372,7 @@ const NoFiChat: React.FC = () => {
     update();
   };
 
+  // -- DECODER STATE MACHINE (DUAL-MODE) --
   const handleFrequencyInput = (freq: number, amplitude: number) => {
     const d = decoderRef.current;
     const now = Date.now();
@@ -415,54 +417,64 @@ const NoFiChat: React.FC = () => {
 
     const isFreq = (target: number, range = 50) => Math.abs(freq - target) < range;
 
-    // --- STATE 1: WAITING FOR MARKER ---
+    // --- STATE 1: SCANNING FOR MARKERS (BOTH MODES) ---
     if (d.state === 'IDLE' || d.state === 'WAIT_MARKER') {
-      if (isFreq(mode.MARKER)) {
+      
+      let detected = false;
+
+      // Check AUDIBLE Marker
+      if (isFreq(PROTOCOL.MODES.AUDIBLE.MARKER)) {
+        d.activeMode = 'AUDIBLE'; // Lock onto Audible
+        detected = true;
+      } 
+      // Check STEALTH Marker
+      else if (isFreq(PROTOCOL.MODES.STEALTH.MARKER)) {
+        d.activeMode = 'STEALTH'; // Lock onto Stealth
+        detected = true;
+      }
+
+      if (detected) {
         d.consecutiveFrames++;
-        // Require 3 frames (~120ms) to confirm marker
-        if (d.consecutiveFrames >= 3) { 
-          console.log("START MARKER DETECTED"); // Debug
+        if (d.consecutiveFrames >= 2) { 
           d.state = 'READ_CHAR';
           d.consecutiveFrames = 0;
           d.lastDetectedChar = null;
           d.lastValidRead = now;
           if (!isReceiving) setIsReceiving(true);
-          if (d.buffer.length > 0) d.silenceTimer = now; // Keep alive
+          // If we switched modes mid-stream (rare), keep timer alive
+          if (d.buffer.length > 0) d.silenceTimer = now; 
         }
       } else {
         d.consecutiveFrames = 0;
       }
     } 
-    // --- STATE 2: READING CHARACTER ---
+    
+    // --- STATE 2: READING DATA (USING LOCKED MODE) ---
     else if (d.state === 'READ_CHAR') {
-      // If we see the marker again, ignore it (it's just the gap or long beep)
-      if (isFreq(mode.MARKER)) {
+      // Pull configuration based on what we detected in State 1
+      const currentConfig = PROTOCOL.MODES[d.activeMode];
+      const currentStep = d.activeMode === 'STEALTH' ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
+
+      // If we see the marker again, it's just a gap/hold
+      if (isFreq(currentConfig.MARKER)) {
         d.consecutiveFrames = 0;
         return;
       }
 
-      // Calculate Character
-      // freq = BASE + (char * STEP)  -->  char = (freq - BASE) / STEP
-      // const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
-      // const rawChar = (freq - mode.BASE) / step;
-      const currentStep = isStealthModeRef.current ? 40 : PROTOCOL.STEP_FREQ;
-      const rawChar = (freq - mode.BASE) / currentStep; // Use currentStep
-      // const rawChar = (freq - mode.BASE) / PROTOCOL.STEP_FREQ;
+      // Decode Character using the LOCKED mode's math
+      const rawChar = (freq - currentConfig.BASE) / currentStep;
       const estimatedChar = Math.round(rawChar);
       
-      // Check if valid ASCII (Space to Tilde)
       if (estimatedChar >= 32 && estimatedChar <= 126) {
-         // Check if the frequency is actually close to the expected center
-         const expectedFreq = mode.BASE + (estimatedChar * currentStep);
+         const expectedFreq = currentConfig.BASE + (estimatedChar * currentStep);
+         
          if (Math.abs(freq - expectedFreq) < (currentStep / 2)) {
-             
              d.consecutiveFrames++;
-             // Require 3 frames to confirm character
              if (d.consecutiveFrames >= 3) {
                const char = String.fromCharCode(estimatedChar);
                
                if (char !== d.lastDetectedChar) {
-                 console.log("CHAR DETECTED:", char); // Debug
+                 console.log(`[${d.activeMode}] CHAR:`, char);
                  d.buffer += char;
                  setIncomingBuffer(d.buffer); 
                  d.lastDetectedChar = char;
