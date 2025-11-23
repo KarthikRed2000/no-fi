@@ -58,7 +58,7 @@ const NoFiChat: React.FC = () => {
     { id: "SYS1", text: "🎯 NoFi Audio Modem Ready • Mesh Network Active", sender: "system", timestamp: new Date() }
   ]);
   const [inputText, setInputText] = useState<string>('');
-  const [logs, setLogs] = useState<Log[]>([]);
+  //const [logs, setLogs] = useState<Log[]>([]);
   const [showOnboarding, setShowOnboarding] = useState<boolean>(true);
   const [micPermission, setMicPermission] = useState<boolean>(false);
   const [isSecureContext, setIsSecureContext] = useState<boolean>(true);
@@ -70,8 +70,8 @@ const NoFiChat: React.FC = () => {
   const [isReceiving, setIsReceiving] = useState<boolean>(false);
   const [incomingBuffer, setIncomingBuffer] = useState<string>('');
   
-  const [signalStrength, setSignalStrength] = useState<number>(0);
-  const [audioLevel, setAudioLevel] = useState<number>(0);
+  // const [signalStrength, setSignalStrength] = useState<number>(0);
+  // const [audioLevel, setAudioLevel] = useState<number>(0);
   
   // Stealth Mode State
   const [isStealthMode, setIsStealthMode] = useState<boolean>(false);
@@ -208,7 +208,7 @@ const NoFiChat: React.FC = () => {
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info'): void => {
     const logEntry: Log = { message, type, timestamp: new Date().toLocaleTimeString() };
-    setLogs(prev => [...prev.slice(-4), logEntry]);
+    //setLogs(prev => [...prev.slice(-4), logEntry]);
   };
 
   const toggleStealthMode = () => {
@@ -395,9 +395,9 @@ const NoFiChat: React.FC = () => {
         sum += dataArray[i];
       }
       
-      const average = sum / bufferLength;
-      setAudioLevel(Math.min(100, (average / 50) * 100));
-      setSignalStrength(Math.floor(Math.min(100, (maxVal / 255) * 100)));
+      //const average = sum / bufferLength;
+      // setAudioLevel(Math.min(100, (average / 50) * 100));
+      // setSignalStrength(Math.floor(Math.min(100, (maxVal / 255) * 100)));
 
       // Only process audio if not currently sending
       if (!isSendingRef.current) {
@@ -623,10 +623,10 @@ const NoFiChat: React.FC = () => {
     });
   };
 
-  const clearRelayQueue = (): void => {
-    setRelayQueue([]);
-    addLog('Relay queue cleared', 'info');
-  };
+  // const clearRelayQueue = (): void => {
+  //   setRelayQueue([]);
+  //   addLog('Relay queue cleared', 'info');
+  // };
 
   return (
     <>
