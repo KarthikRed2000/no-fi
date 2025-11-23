@@ -208,6 +208,7 @@ const NoFiChat: React.FC = () => {
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info'): void => {
     const logEntry: Log = { message, type, timestamp: new Date().toLocaleTimeString() };
+    console.log(`[${logEntry.timestamp}] [${logEntry.type.toUpperCase()}] ${logEntry.message}`);
     //setLogs(prev => [...prev.slice(-4), logEntry]);
   };
 
