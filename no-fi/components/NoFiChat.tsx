@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, MicOff, Signal, WifiOff, Activity, Lock, Loader2, Inbox } from 'lucide-react';
+import { Send, Mic, MicOff, Signal, WifiOff, Activity, Lock, Loader2, Inbox, MapPin } from 'lucide-react';
 // import { pipeline } from '@xenova/transformers';
 import { X, Zap, Radio, Waves, MessageCircle } from 'lucide-react';
 
@@ -57,6 +57,9 @@ const NoFiChat: React.FC = () => {
   const [signalStrength, setSignalStrength] = useState<number>(0);
   const [audioLevel, setAudioLevel] = useState<number>(0);
   
+  const [locationPermission, setLocationPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
+  const [isFetchingLocation, setIsFetchingLocation] = useState<boolean>(false);
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -75,49 +78,6 @@ const NoFiChat: React.FC = () => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
 
-  // 1. Load the Model on Startup (One time)
-  // useEffect(() => {
-  //   const loadModel = async () => {
-  //     setIsModelLoading(true);
-  //     try {
-  //       // 'task' is automatic-speech-recognition
-  //       // 'model' is the quantized tiny version (small and fast)
-  //       const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
-  //       setTranscriber(() => pipe); // Store function in state
-  //       addLog("Offline AI Voice Model Loaded", "success");
-  //     } catch (err) {
-  //       console.error(err);
-  //       addLog("Failed to load Offline AI", "error");
-  //     }
-  //     setIsModelLoading(false);
-  //   };
-    
-  //   // Trigger load only if user wants voice features (or auto-load)
-  //   // For hackathon, maybe put a "Load Voice AI" button to save initial bandwidth
-  //   // loadModel(); 
-  // }, []);
-
-  // // 2. Function to Transcribe Audio Blob
-  // const transcribeAudio = async (audioBlob: Blob) => {
-  //   if (!transcriber) {
-  //       alert("AI Model not loaded yet!");
-  //       return;
-  //   }
-    
-  //   setIsDictating(true);
-    
-  //   // Convert Blob to URL for the model
-  //   const url = URL.createObjectURL(audioBlob);
-    
-  //   try {
-  //       const result = await transcriber(url);
-  //       setInputText(prev => prev + " " + result.text);
-  //   } catch (e) {
-  //       console.error(e);
-  //   }
-    
-  //   setIsDictating(false);
-  // };
   const isSendingRef = useRef<boolean>(false);
   const seenIdsRef = useRef<Set<string>>(new Set(["SYS1"]));
 
@@ -133,6 +93,20 @@ const NoFiChat: React.FC = () => {
   });
 
   const generateId = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+
+  // Check location permission on mount
+  useEffect(() => {
+    if (navigator.permissions) {
+      navigator.permissions.query({ name: 'geolocation' as PermissionName }).then((result) => {
+        setLocationPermission(result.state as 'prompt' | 'granted' | 'denied');
+        result.onchange = () => {
+          setLocationPermission(result.state as 'prompt' | 'granted' | 'denied');
+        };
+      }).catch(() => {
+        // Permissions API not supported, keep as 'prompt'
+      });
+    }
+  }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -246,6 +220,53 @@ const NoFiChat: React.FC = () => {
       addLog('Microphone access denied', 'error');
       console.error('Microphone error:', err);
     }
+  };
+
+  const shareLocation = async (): Promise<void> => {
+    if (!navigator.geolocation) {
+      addLog('Geolocation not supported', 'error');
+      return;
+    }
+
+    setIsFetchingLocation(true);
+    addLog('Requesting location...', 'info');
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { latitude, longitude, accuracy } = position.coords;
+        const locationText = `📍 Location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)} (±${Math.round(accuracy)}m)`;
+        
+        setInputText(locationText);
+        setLocationPermission('granted');
+        setIsFetchingLocation(false);
+        addLog('Location acquired', 'success');
+      },
+      (error) => {
+        setIsFetchingLocation(false);
+        
+        switch (error.code) {
+          case error.PERMISSION_DENIED:
+            setLocationPermission('denied');
+            addLog('Location permission denied', 'error');
+            break;
+          case error.POSITION_UNAVAILABLE:
+            addLog('Location unavailable', 'error');
+            break;
+          case error.TIMEOUT:
+            addLog('Location request timeout', 'error');
+            break;
+          default:
+            addLog('Location error', 'error');
+        }
+        
+        console.error('Geolocation error:', error);
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0
+      }
+    );
   };
 
   const transmitAudio = (payload: string, onComplete?: () => void) => {
@@ -483,7 +504,6 @@ const NoFiChat: React.FC = () => {
     };
   }, []);
 
-  // 1. LOAD WHISPER MODEL (Runs once on mount)
   // 1. LOAD WHISPER MODEL
   useEffect(() => {
     const loadModel = async () => {
@@ -1242,7 +1262,7 @@ const NoFiChat: React.FC = () => {
         <div className="p-3 sm:p-4 bg-gray-900/95 backdrop-blur border-t border-gray-700 flex-shrink-0 z-20">
           <div className="flex items-center gap-2 sm:gap-3 max-w-4xl mx-auto">
             
-            {/* NEW: Offline AI Voice Button */}
+            {/* Offline AI Voice Button */}
             <button
               onClick={toggleAiRecording}
               disabled={isModelLoading || !micPermission}
@@ -1267,6 +1287,40 @@ const NoFiChat: React.FC = () => {
                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
                    <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
                  </span>
+              )}
+            </button>
+
+            {/* NEW: Location Share Button */}
+            <button
+              onClick={shareLocation}
+              disabled={!micPermission || isFetchingLocation || locationPermission === 'denied'}
+              className={`p-2 sm:p-3 rounded-xl transition-all transform hover:scale-105 flex-shrink-0 border relative ${
+                isFetchingLocation 
+                  ? 'bg-orange-500/20 border-orange-500 text-orange-400 animate-pulse' 
+                  : locationPermission === 'denied'
+                  ? 'bg-gray-700 border-gray-600 text-gray-500 cursor-not-allowed'
+                  : 'bg-gray-800 border-gray-600 text-gray-400 hover:text-white hover:border-gray-500'
+              }`}
+              title={
+                locationPermission === 'denied' 
+                  ? "Location access denied. Please enable in browser settings." 
+                  : isFetchingLocation 
+                  ? "Fetching location..." 
+                  : "Share your GPS location"
+              }
+            >
+              {isFetchingLocation ? (
+                <Loader2 className="w-5 h-5 animate-spin text-orange-500" />
+              ) : (
+                <MapPin className="w-5 h-5" />
+              )}
+              
+              {/* Location Permission Status Indicator */}
+              {locationPermission === 'granted' && !isFetchingLocation && (
+                <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                </span>
               )}
             </button>
 
