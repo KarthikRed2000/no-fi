@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Send, Mic, MicOff, Signal, WifiOff, Activity, Lock, Loader2, Inbox, MapPin } from 'lucide-react';
-// import { pipeline } from '@xenova/transformers';
 import { X, Zap, Radio, Waves, MessageCircle } from 'lucide-react';
 
 interface Message {
@@ -25,21 +24,39 @@ interface RelayMessage {
 }
 
 const PROTOCOL = {
-  MARKER_FREQ: 1200,
-  BASE_FREQ: 1500,
-  STEP_FREQ: 40,
-  TONE_DURATION: 0.08,
-  GAP_DURATION: 0.02,
-  FFT_SIZE: 2048,
-  THRESHOLD: 30,
+  // Timing
+  TONE_DURATION: 0.12,
+  GAP_DURATION: 0.04,
   SILENCE_TIMEOUT: 1500,
   IDLE_TIMEOUT: 3000,
-  SEPARATOR: '|'
+  
+  // FFT
+  FFT_SIZE: 2048,
+  THRESHOLD: 30,
+  RANGE: 100,
+  
+  // Frequencies
+  STEP_FREQ: 60,
+  SEPARATOR: '|',
+  
+  // Dual Mode Configuration
+  MODES: {
+    AUDIBLE: { 
+      MARKER: 1200, 
+      BASE: 1500,
+      STEP_FREQ: 60
+    }, 
+    STEALTH: { 
+      MARKER: 16000, 
+      BASE: 16500,
+      STEP_FREQ: 40 // Tighter for ultrasonic bandwidth
+    }
+  }
 };
 
 const NoFiChat: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([
-    { id: "SYS1", text: "🎯 NoFi Audio Modem Ready • Mesh Network Active", sender: "system", timestamp: new Date() }
+    { id: "SYS1", text: "🎯 NoFi Audio Modem Ready • Mesh Network Active • Dual-Mode Capable", sender: "system", timestamp: new Date() }
   ]);
   const [inputText, setInputText] = useState<string>('');
   const [logs, setLogs] = useState<Log[]>([]);
@@ -60,20 +77,18 @@ const NoFiChat: React.FC = () => {
   const [locationPermission, setLocationPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [isFetchingLocation, setIsFetchingLocation] = useState<boolean>(false);
   
+  // STEALTH MODE STATE
+  const [isStealthMode, setIsStealthMode] = useState<boolean>(false);
+  const isStealthModeRef = useRef<boolean>(false);
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
-  // -- OFFLINE AI STATE --
-  // const [transcriber, setTranscriber] = useState<any>(null);
-  // const [isModelLoading, setIsModelLoading] = useState<boolean>(false);
-  // ... inside NoFiChat component ...
-
-  // -- OFFLINE AI STATE --
   const [transcriber, setTranscriber] = useState<any>(null);
-  const [isModelLoading, setIsModelLoading] = useState<boolean>(true); // Start true to load immediately
+  const [isModelLoading, setIsModelLoading] = useState<boolean>(true);
   const [isRecordingAI, setIsRecordingAI] = useState<boolean>(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -89,12 +104,20 @@ const NoFiChat: React.FC = () => {
     lastValidRead: Date.now(),
     lastCharDecoded: Date.now(),
     consecutiveFrames: 0,
-    lastFreqIndex: 0
+    lastFreqIndex: 0,
+    activeMode: 'AUDIBLE' as 'AUDIBLE' | 'STEALTH' // Track detected mode
   });
 
   const generateId = () => Math.random().toString(36).substring(2, 6).toUpperCase();
 
-  // Check location permission on mount
+  // STEALTH MODE TOGGLE FUNCTION
+  const toggleStealthMode = () => {
+    const newMode = !isStealthMode;
+    setIsStealthMode(newMode);
+    isStealthModeRef.current = newMode;
+    addLog(`Switched to ${newMode ? 'STEALTH (16kHz)' : 'AUDIBLE (1.2kHz)'} mode`, 'info');
+  };
+
   useEffect(() => {
     if (navigator.permissions) {
       navigator.permissions.query({ name: 'geolocation' as PermissionName }).then((result) => {
@@ -102,9 +125,7 @@ const NoFiChat: React.FC = () => {
         result.onchange = () => {
           setLocationPermission(result.state as 'prompt' | 'granted' | 'denied');
         };
-      }).catch(() => {
-        // Permissions API not supported, keep as 'prompt'
-      });
+      }).catch(() => {});
     }
   }, []);
 
@@ -269,12 +290,17 @@ const NoFiChat: React.FC = () => {
     );
   };
 
+  // UPDATED TRANSMITTER WITH DUAL MODE SUPPORT
   const transmitAudio = (payload: string, onComplete?: () => void) => {
     if (!audioContextRef.current) return;
     
     const ctx = audioContextRef.current;
     
     if (ctx.state === 'suspended') ctx.resume();
+
+    // Select mode configuration
+    const mode = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH : PROTOCOL.MODES.AUDIBLE;
+    const currentStep = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.MODES.AUDIBLE.STEP_FREQ;
 
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
@@ -288,14 +314,16 @@ const NoFiChat: React.FC = () => {
 
     for (let i = 0; i < payload.length; i++) {
       const charCode = payload.charCodeAt(i);
-      const freq = PROTOCOL.BASE_FREQ + (charCode * PROTOCOL.STEP_FREQ);
+      const freq = mode.BASE + (charCode * currentStep);
 
-      osc.frequency.setValueAtTime(PROTOCOL.MARKER_FREQ, startTime);
+      // Marker Tone
+      osc.frequency.setValueAtTime(mode.MARKER, startTime);
       gain.gain.setValueAtTime(0.5, startTime);
       gain.gain.setValueAtTime(0.5, startTime + PROTOCOL.TONE_DURATION);
       gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.005); 
       startTime += PROTOCOL.TONE_DURATION + PROTOCOL.GAP_DURATION;
 
+      // Data Tone
       osc.frequency.setValueAtTime(freq, startTime);
       gain.gain.setValueAtTime(0.5, startTime);
       gain.gain.setValueAtTime(0.5, startTime + PROTOCOL.TONE_DURATION);
@@ -360,6 +388,7 @@ const NoFiChat: React.FC = () => {
     update();
   };
 
+  // UPDATED DECODER WITH DUAL MODE DETECTION
   const handleFrequencyInput = (freq: number, amplitude: number) => {
     const d = decoderRef.current;
     const now = Date.now();
@@ -398,47 +427,73 @@ const NoFiChat: React.FC = () => {
       d.silenceTimer = null;
     }
 
-    const isFreq = (target: number, range = 50) => Math.abs(freq - target) < range;
+    const isFreq = (target: number, range = PROTOCOL.RANGE) => Math.abs(freq - target) < range;
 
+    // STATE 1: SCANNING FOR MARKERS (BOTH MODES)
     if (d.state === 'IDLE' || d.state === 'WAIT_MARKER') {
-      if (isFreq(PROTOCOL.MARKER_FREQ)) {
+      let detected = false;
+
+      // Check AUDIBLE Marker
+      if (isFreq(PROTOCOL.MODES.AUDIBLE.MARKER)) {
+        d.activeMode = 'AUDIBLE';
+        detected = true;
+      } 
+      // Check STEALTH Marker
+      else if (isFreq(PROTOCOL.MODES.STEALTH.MARKER)) {
+        d.activeMode = 'STEALTH';
+        detected = true;
+      }
+
+      if (detected) {
         d.consecutiveFrames++;
-        if (d.consecutiveFrames > 2) { 
+        if (d.consecutiveFrames >= 2) { 
           d.state = 'READ_CHAR';
           d.consecutiveFrames = 0;
           d.lastDetectedChar = null;
           d.lastValidRead = now;
           if (!isReceiving) setIsReceiving(true);
+          if (d.buffer.length > 0) d.silenceTimer = now;
         }
       } else {
         d.consecutiveFrames = 0;
       }
     } 
+    // STATE 2: READING DATA (USING LOCKED MODE)
     else if (d.state === 'READ_CHAR') {
-      if (!isFreq(PROTOCOL.MARKER_FREQ)) {
-        const estimatedChar = Math.round((freq - PROTOCOL.BASE_FREQ) / PROTOCOL.STEP_FREQ);
+      const currentConfig = PROTOCOL.MODES[d.activeMode];
+      const currentStep = d.activeMode === 'STEALTH' ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.MODES.AUDIBLE.STEP_FREQ;
+
+      // Skip if it's the marker
+      if (isFreq(currentConfig.MARKER)) {
+        d.consecutiveFrames = 0;
+        return;
+      }
+
+      // Decode Character using the LOCKED mode's math
+      const rawChar = (freq - currentConfig.BASE) / currentStep;
+      const estimatedChar = Math.round(rawChar);
+      
+      if (estimatedChar >= 32 && estimatedChar <= 126) {
+        const expectedFreq = currentConfig.BASE + (estimatedChar * currentStep);
         
-        if (estimatedChar >= 32 && estimatedChar <= 126) {
-           d.consecutiveFrames++;
-           
-           if (d.consecutiveFrames > 3) {
-             const char = String.fromCharCode(estimatedChar);
-             
-             if (char !== d.lastDetectedChar) {
-               d.buffer += char;
-               setIncomingBuffer(d.buffer);
-               d.lastDetectedChar = char;
-               d.lastCharDecoded = now;
-               d.state = 'WAIT_MARKER'; 
-               d.consecutiveFrames = 0;
-               d.lastValidRead = now;
-             }
-           }
-        } else {
-          d.consecutiveFrames = 0;
+        if (Math.abs(freq - expectedFreq) < (currentStep / 2)) {
+          d.consecutiveFrames++;
+          if (d.consecutiveFrames >= 3) {
+            const char = String.fromCharCode(estimatedChar);
+            
+            if (char !== d.lastDetectedChar) {
+              d.buffer += char;
+              setIncomingBuffer(d.buffer);
+              d.lastDetectedChar = char;
+              d.lastCharDecoded = now;
+              d.state = 'WAIT_MARKER'; 
+              d.consecutiveFrames = 0;
+              d.lastValidRead = now;
+            }
+          }
         }
       } else {
-         d.consecutiveFrames = 0;
+        d.consecutiveFrames = 0;
       }
     }
   };
@@ -483,7 +538,7 @@ const NoFiChat: React.FC = () => {
         };
         setRelayQueue(prev => [...prev, relayMessage]);
         
-        addLog(`RX: #${msgId} (relay in ${Math.round(randomDelay/1000)}s)`, 'success');
+        addLog(`RX: #${msgId} [${d.activeMode}] (relay in ${Math.round(randomDelay/1000)}s)`, 'success');
       }
     }
     
@@ -504,27 +559,22 @@ const NoFiChat: React.FC = () => {
     };
   }, []);
 
-  // 1. LOAD WHISPER MODEL
   useEffect(() => {
     const loadModel = async () => {
       try {
         addLog("Loading AI engine...", "info");
         
-        // --- THE FIX: Load from CDN to bypass Vite bundling errors ---
         // @ts-ignore
         const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
         
-        // Configure to allow local models if cached, or fetch from remote
         env.allowLocalModels = false; 
         
-        // Load the model
         addLog("Downloading model weights (~40MB)...", "info");
         const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
         
         setTranscriber(() => pipe); 
         setIsModelLoading(false);
         addLog("Offline AI Ready! (WiFi can now be turned off)", "success");
-        // -------------------------------------------------------------
 
       } catch (err) {
         console.error(err);
@@ -535,18 +585,15 @@ const NoFiChat: React.FC = () => {
     loadModel();
   }, []);
 
-  // 2. TRANSCRIBE AUDIO (The "Brain")
   const transcribeAudio = async (audioBlob: Blob) => {
     if (!transcriber) return;
     
     addLog("Processing speech locally...", "info");
     
-    // Create a URL for the blob so the model can read it
     const url = URL.createObjectURL(audioBlob);
     
     try {
         const result = await transcriber(url);
-        // Append result to input text
         setInputText(prev => (prev + " " + result.text).trim());
     } catch (e) {
         console.error(e);
@@ -554,16 +601,13 @@ const NoFiChat: React.FC = () => {
     }
   };
 
-  // 3. HANDLE RECORDING (The "Ears")
   const toggleAiRecording = async () => {
-    // A. If currently recording, STOP it.
     if (isRecordingAI && mediaRecorderRef.current) {
         mediaRecorderRef.current.stop();
         setIsRecordingAI(false);
         return;
     }
 
-    // B. If NOT recording, START it.
     if (!transcriber) {
         addLog("AI Model is still loading...", "error");
         return;
@@ -573,7 +617,7 @@ const NoFiChat: React.FC = () => {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const mediaRecorder = new MediaRecorder(stream);
         mediaRecorderRef.current = mediaRecorder;
-        chunksRef.current = []; // Reset chunks
+        chunksRef.current = [];
 
         mediaRecorder.ondataavailable = (event) => {
             if (event.data.size > 0) {
@@ -585,7 +629,6 @@ const NoFiChat: React.FC = () => {
             const audioBlob = new Blob(chunksRef.current, { type: 'audio/wav' });
             transcribeAudio(audioBlob);
             
-            // Stop all tracks to release mic
             stream.getTracks().forEach(track => track.stop());
         };
 
@@ -619,7 +662,7 @@ const NoFiChat: React.FC = () => {
     setIsSending(true);
     isSendingRef.current = true;
     
-    addLog(`TX: #${newId}`, 'info');
+    addLog(`TX: #${newId} [${isStealthMode ? 'STEALTH' : 'AUDIBLE'}]`, 'info');
     
     transmitAudio(payload, () => {
       setIsSending(false);
@@ -858,7 +901,6 @@ const NoFiChat: React.FC = () => {
           100% { transform: scale(1) rotate(0deg); }
         }
         
-        /* Mobile optimizations */
         @media (max-width: 640px) {
           .glass-ultra, .glass-card {
             backdrop-filter: blur(20px) saturate(150%);
@@ -866,12 +908,10 @@ const NoFiChat: React.FC = () => {
           }
         }
         
-        /* Smooth scrolling */
         * {
           scroll-behavior: smooth;
         }
         
-        /* Custom scrollbar */
         ::-webkit-scrollbar {
           width: 6px;
           height: 6px;
@@ -889,7 +929,6 @@ const NoFiChat: React.FC = () => {
           background: linear-gradient(180deg, #0891b2, #2563eb);
         }
         
-        /* Input focus glow */
         .input-glow:focus {
           box-shadow: 
             0 0 0 3px rgba(6, 182, 212, 0.2),
@@ -897,20 +936,17 @@ const NoFiChat: React.FC = () => {
             inset 0 0 10px rgba(6, 182, 212, 0.1);
         }
         
-        /* Button press effect */
         .btn-press:active {
           transform: scale(0.95);
           transition: transform 0.1s ease;
         }
       `}</style>
 
-      {/* Onboarding Modal */}
       {showOnboarding && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/80 backdrop-blur-2xl animate-fadeIn" />
           
           <div className="relative glass-ultra rounded-[2rem] p-8 sm:p-12 w-full max-w-md shadow-2xl animate-float border-2 border-cyan-500/20">
-            {/* Floating particles effect */}
             <div className="absolute inset-0 overflow-hidden rounded-[2rem] pointer-events-none">
               {[...Array(12)].map((_, i) => (
                 <div
@@ -942,7 +978,7 @@ const NoFiChat: React.FC = () => {
             </h2>
             
             <p className="text-center text-cyan-100/90 mb-3 text-base sm:text-lg px-4 font-medium relative z-10">
-              Audio-based mesh network
+              Audio-based mesh network with dual-mode support
             </p>
             
             <div className="glass-card rounded-2xl p-5 mb-8 border border-cyan-500/30 shimmer-effect relative z-10">
@@ -959,7 +995,7 @@ const NoFiChat: React.FC = () => {
                   </p>
                   <p className="flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
-                    Mesh network routing
+                    Dual-mode: Audible & Stealth
                   </p>
                 </div>
               </div>
@@ -987,7 +1023,6 @@ const NoFiChat: React.FC = () => {
         </div>
       )}
 
-      {/* Relay Queue Panel */}
       {showRelayQueue && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div 
@@ -1082,10 +1117,8 @@ const NoFiChat: React.FC = () => {
         </div>
       )}
 
-      {/* Main Chat Interface */}
       <div className="h-screen w-full mesh-gradient flex flex-col overflow-hidden relative">
         
-        {/* Header */}
         <div className="relative glass-ultra border-b border-white/10 shadow-2xl z-20 animate-slideDown">
           <div className="p-4 sm:p-5 flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 flex-1 min-w-0">
@@ -1113,17 +1146,17 @@ const NoFiChat: React.FC = () => {
                   {isSending ? (
                     <>
                       <Signal className="w-3 h-3 animate-pulse" />
-                      TX: SENDING
+                      TX: SENDING [{isStealthMode ? 'STEALTH' : 'AUDIBLE'}]
                     </>
                   ) : isReceiving ? (
                     <>
                       <Signal className="w-3 h-3 animate-pulse" />
-                      RX: DECODING
+                      RX: DECODING [{decoderRef.current.activeMode}]
                     </>
                   ) : (
                     <>
                       <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                      IDLE
+                      IDLE • MODE: {isStealthMode ? 'STEALTH' : 'AUDIBLE'}
                     </>
                   )}
                 </p>
@@ -1131,6 +1164,31 @@ const NoFiChat: React.FC = () => {
             </div>
             
             <div className="flex items-center gap-2 flex-shrink-0">
+              {/* STEALTH MODE TOGGLE BUTTON */}
+              <button
+                onClick={toggleStealthMode}
+                className={`
+                  hidden sm:flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-bold border transition-all transform hover:scale-105 active:scale-95
+                  ${isStealthMode 
+                    ? 'bg-red-900/80 border-red-500 text-red-200 animate-pulse shadow-[0_0_15px_rgba(239,68,68,0.5)] glass-card' 
+                    : 'glass-card border-white/20 text-blue-200 hover:bg-white/10'}
+                `}
+                title={`Current: ${isStealthMode ? 'STEALTH (16kHz ultrasonic)' : 'AUDIBLE (1.2kHz)'}`}
+              >
+                {isStealthMode ? (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
+                    <span className="hidden md:inline">STEALTH</span>
+                    <span className="md:hidden">🔇</span>
+                  </>
+                ) : (
+                  <>
+                    <Signal className="w-3 h-3" />
+                    <span className="hidden md:inline">AUDIBLE</span>
+                  </>
+                )}
+              </button>
+
               <button
                 onClick={() => setShowRelayQueue(true)}
                 className="relative glass-card hover:bg-white/10 p-3 rounded-xl transition-all border border-white/10 group transform hover:scale-110 active:scale-95 btn-press"
@@ -1166,31 +1224,42 @@ const NoFiChat: React.FC = () => {
           </div>
         </div>
 
-        {/* Messages Area */}
         <div className="flex-1 relative overflow-hidden flex flex-col">
           
           {isSending && (
             <div className="absolute inset-0 pointer-events-none z-20">
-              <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/5 via-blue-500/10 to-purple-500/5 animate-pulse" />
+              <div className={`absolute inset-0 animate-pulse ${isStealthMode ? 'bg-gradient-to-r from-red-500/5 via-pink-500/10 to-red-500/5' : 'bg-gradient-to-r from-cyan-500/5 via-blue-500/10 to-purple-500/5'}`} />
               <div className="absolute top-0 left-0 w-full h-1">
-                <div className="h-full bg-gradient-to-r from-transparent via-cyan-500 to-transparent animate-pulse shadow-lg" />
+                <div className={`h-full animate-pulse shadow-lg ${isStealthMode ? 'bg-gradient-to-r from-transparent via-red-500 to-transparent' : 'bg-gradient-to-r from-transparent via-cyan-500 to-transparent'}`} />
               </div>
             </div>
           )}
 
           {isReceiving && (
              <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 z-30 animate-bounceIn max-w-[90%]">
-                <div className="glass-ultra px-6 sm:px-8 py-4 sm:py-5 rounded-2xl border-2 border-green-500/60 shadow-2xl">
+                <div className={`glass-ultra px-6 sm:px-8 py-4 sm:py-5 rounded-2xl border-2 shadow-2xl ${
+                  decoderRef.current.activeMode === 'STEALTH' 
+                    ? 'border-red-500/60' 
+                    : 'border-green-500/60'
+                }`}>
                   <div className="flex flex-col items-center gap-3">
-                    <span className="text-green-400 text-xs font-mono uppercase tracking-widest flex items-center gap-2 font-bold">
+                    <span className={`text-xs font-mono uppercase tracking-widest flex items-center gap-2 font-bold ${
+                      decoderRef.current.activeMode === 'STEALTH' ? 'text-red-400' : 'text-green-400'
+                    }`}>
                       <Activity className="w-5 h-5 animate-pulse" />
-                      <span className="hidden sm:inline">Decoding Audio Stream</span>
+                      <span className="hidden sm:inline">Decoding {decoderRef.current.activeMode} Stream</span>
                       <span className="sm:hidden">Decoding...</span>
                     </span>
-                    <div className="glass-card px-4 py-2 rounded-xl border border-green-500/30">
+                    <div className={`glass-card px-4 py-2 rounded-xl border ${
+                      decoderRef.current.activeMode === 'STEALTH' 
+                        ? 'border-red-500/30' 
+                        : 'border-green-500/30'
+                    }`}>
                       <span className="text-white font-mono text-lg sm:text-xl font-bold flex items-center">
                         {incomingBuffer || '_'}
-                        <span className="animate-pulse ml-1 text-green-400">█</span>
+                        <span className={`animate-pulse ml-1 ${
+                          decoderRef.current.activeMode === 'STEALTH' ? 'text-red-400' : 'text-green-400'
+                        }`}>█</span>
                       </span>
                     </div>
                   </div>
@@ -1262,7 +1331,6 @@ const NoFiChat: React.FC = () => {
         <div className="p-3 sm:p-4 bg-gray-900/95 backdrop-blur border-t border-gray-700 flex-shrink-0 z-20">
           <div className="flex items-center gap-2 sm:gap-3 max-w-4xl mx-auto">
             
-            {/* Offline AI Voice Button */}
             <button
               onClick={toggleAiRecording}
               disabled={isModelLoading || !micPermission}
@@ -1281,7 +1349,6 @@ const NoFiChat: React.FC = () => {
                 <Mic className="w-5 h-5" />
               )}
               
-              {/* Ready Indicator Dot */}
               {!isModelLoading && !isRecordingAI && transcriber && (
                  <span className="absolute -top-1 -right-1 flex h-2 w-2">
                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
@@ -1290,7 +1357,6 @@ const NoFiChat: React.FC = () => {
               )}
             </button>
 
-            {/* NEW: Location Share Button */}
             <button
               onClick={shareLocation}
               disabled={!micPermission || isFetchingLocation || locationPermission === 'denied'}
@@ -1315,7 +1381,6 @@ const NoFiChat: React.FC = () => {
                 <MapPin className="w-5 h-5" />
               )}
               
-              {/* Location Permission Status Indicator */}
               {locationPermission === 'granted' && !isFetchingLocation && (
                 <span className="absolute -top-1 -right-1 flex h-2 w-2">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
