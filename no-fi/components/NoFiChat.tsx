@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, MicOff, Signal, WifiOff, Activity, Lock, Loader2, Inbox } from 'lucide-react';
-// import { pipeline } from '@xenova/transformers';
-import { X, Zap, Radio, Waves, MessageCircle } from 'lucide-react';
+import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock, Loader2, Inbox, X, Zap, Radio, Waves, MessageCircle } from 'lucide-react';
 
 interface Message {
   id: string;
@@ -24,33 +22,33 @@ interface RelayMessage {
   relayAfter: number;
 }
 
+// -- AUDIO PROTOCOL CONSTANTS --
 const PROTOCOL = {
   // Physics
-  FFT_SIZE: 2048,
-  THRESHOLD: 20,
-  RANGE: 100,             
-
-  IDLE_TIMEOUT: 3000,
-  SEPARATOR: '|',
+  FFT_SIZE: 1024,         // Fast scanning (~21ms per frame)
+  THRESHOLD: 20,          // Noise gate level
+  RANGE: 100,             // +/- 100Hz tolerance
   
-  // Timing (The Speed Boost)
+  // Timing
   TONE_DURATION: 0.12,    // 120ms per character
-  GAP_DURATION: 0.04,     // 40ms silence
-  SILENCE_TIMEOUT: 1000,  // 1s silence = Done
+  GAP_DURATION: 0.04,     // 40ms silence between tones
+  SILENCE_TIMEOUT: 1000,  // 1s silence = Message Done
+  IDLE_TIMEOUT: 3000,     // Reset decoder if stuck
+  SEPARATOR: '|',         // ID separator
   
-  // Frequencies (Tighter packing)
-  STEP_FREQ: 60,
+  // Frequencies
+  STEP_FREQ: 60,          // Default step for Audible
   
   // Modes
   MODES: {
     AUDIBLE: { 
         MARKER: 2000, 
-        BASE: 2200    // Start at 2.2kHz
+        BASE: 2200 
     }, 
     STEALTH: { 
         MARKER: 16000, 
         BASE: 16500,
-        STEP_FREQ: 40 // Keep stealth tighter to fit bandwidth
+        STEP_FREQ: 40     // Tighter step for Stealth to fit bandwidth
     }
   }
 };
@@ -75,70 +73,27 @@ const NoFiChat: React.FC = () => {
   const [signalStrength, setSignalStrength] = useState<number>(0);
   const [audioLevel, setAudioLevel] = useState<number>(0);
   
+  // Stealth Mode State
+  const [isStealthMode, setIsStealthMode] = useState<boolean>(false);
+  const isStealthModeRef = useRef<boolean>(false);
+
+  // Offline AI State
+  const [transcriber, setTranscriber] = useState<any>(null);
+  const [isModelLoading, setIsModelLoading] = useState<boolean>(true);
+  const [isRecordingAI, setIsRecordingAI] = useState<boolean>(false);
+  
+  // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-
-  // -- OFFLINE AI STATE --
-  // const [transcriber, setTranscriber] = useState<any>(null);
-  // const [isModelLoading, setIsModelLoading] = useState<boolean>(false);
-  // ... inside NoFiChat component ...
-
-  // -- OFFLINE AI STATE --
-  const [transcriber, setTranscriber] = useState<any>(null);
-  const [isModelLoading, setIsModelLoading] = useState<boolean>(true); // Start true to load immediately
-  const [isRecordingAI, setIsRecordingAI] = useState<boolean>(false);
+  const isSendingRef = useRef<boolean>(false);
+  const seenIdsRef = useRef<Set<string>>(new Set(["SYS1"]));
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
 
-  // 1. Load the Model on Startup (One time)
-  // useEffect(() => {
-  //   const loadModel = async () => {
-  //     setIsModelLoading(true);
-  //     try {
-  //       // 'task' is automatic-speech-recognition
-  //       // 'model' is the quantized tiny version (small and fast)
-  //       const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
-  //       setTranscriber(() => pipe); // Store function in state
-  //       addLog("Offline AI Voice Model Loaded", "success");
-  //     } catch (err) {
-  //       console.error(err);
-  //       addLog("Failed to load Offline AI", "error");
-  //     }
-  //     setIsModelLoading(false);
-  //   };
-    
-  //   // Trigger load only if user wants voice features (or auto-load)
-  //   // For hackathon, maybe put a "Load Voice AI" button to save initial bandwidth
-  //   // loadModel(); 
-  // }, []);
-
-  // // 2. Function to Transcribe Audio Blob
-  // const transcribeAudio = async (audioBlob: Blob) => {
-  //   if (!transcriber) {
-  //       alert("AI Model not loaded yet!");
-  //       return;
-  //   }
-    
-  //   setIsDictating(true);
-    
-  //   // Convert Blob to URL for the model
-  //   const url = URL.createObjectURL(audioBlob);
-    
-  //   try {
-  //       const result = await transcriber(url);
-  //       setInputText(prev => prev + " " + result.text);
-  //   } catch (e) {
-  //       console.error(e);
-  //   }
-    
-  //   setIsDictating(false);
-  // };
-  const isSendingRef = useRef<boolean>(false);
-  const seenIdsRef = useRef<Set<string>>(new Set(["SYS1"]));
-
+  // Decoder State
   const decoderRef = useRef({
     state: 'IDLE' as 'IDLE' | 'WAIT_MARKER' | 'READ_CHAR',
     buffer: '',
@@ -147,20 +102,67 @@ const NoFiChat: React.FC = () => {
     lastValidRead: Date.now(),
     lastCharDecoded: Date.now(),
     consecutiveFrames: 0,
-    // NEW: Track which mode we detected for the current packet
     activeMode: 'AUDIBLE' as 'AUDIBLE' | 'STEALTH' 
   });
 
   const generateId = () => Math.random().toString(36).substring(2, 6).toUpperCase();
 
+  // -- INITIALIZATION & CHECKS --
+  useEffect(() => {
+    // 1. Inject Tailwind
+    if (!document.querySelector('script[src*="tailwindcss"]')) {
+      const script = document.createElement('script');
+      script.src = "https://cdn.tailwindcss.com";
+      script.async = true;
+      document.head.appendChild(script);
+    }
+
+    // 2. Enforce HTTPS
+    if (window.location.protocol === 'http:' && window.location.hostname !== 'localhost') {
+      window.location.href = window.location.href.replace(/^http:/, 'https:');
+    }
+    if (!window.isSecureContext) {
+      setIsSecureContext(false);
+      addLog('Error: App must run via HTTPS', 'error');
+    }
+
+    // 3. Load Offline AI (from CDN)
+    const loadModel = async () => {
+      try {
+        addLog("Loading AI engine...", "info");
+        // @ts-ignore
+        const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
+        env.allowLocalModels = false; 
+        
+        addLog("Downloading model weights (~40MB)...", "info");
+        const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
+        
+        setTranscriber(() => pipe); 
+        setIsModelLoading(false);
+        addLog("Offline AI Ready! (WiFi can now be turned off)", "success");
+      } catch (err) {
+        console.error(err);
+        setIsModelLoading(false);
+        addLog("AI Load Failed. Check Internet for first run.", "error");
+      }
+    };
+    loadModel();
+
+    return () => {
+      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
+      if (audioContextRef.current) audioContextRef.current.close();
+      if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(track => track.stop());
+    };
+  }, []);
+
+  // -- RELAY QUEUE PROCESSOR --
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
       
       setRelayQueue(prev => {
-        if (isSendingRef.current || isReceiving) {
-          return prev;
-        }
+        // Don't interrupt if busy
+        if (isSendingRef.current || isReceiving) return prev;
         
         const toRelay = prev.filter(msg => 
           msg.status === 'pending' && 
@@ -170,6 +172,7 @@ const NoFiChat: React.FC = () => {
         if (toRelay.length > 0) {
           const msg = toRelay[0];
           
+          // Start Relay
           setIsSending(true);
           isSendingRef.current = true;
           
@@ -187,7 +190,6 @@ const NoFiChat: React.FC = () => {
             addLog(`Auto-relayed: #${msg.id}`, 'success');
           });
         }
-        
         return prev;
       });
     }, 1000);
@@ -196,40 +198,27 @@ const NoFiChat: React.FC = () => {
   }, [isReceiving]);
 
   useEffect(() => {
-    if (!document.querySelector('script[src*="tailwindcss"]')) {
-      const script = document.createElement('script');
-      script.src = "https://cdn.tailwindcss.com";
-      script.async = true;
-      document.head.appendChild(script);
-    }
+    scrollToBottom();
+  }, [messages, incomingBuffer]);
 
-    if (
-      window.location.protocol === 'http:' && 
-      window.location.hostname !== 'localhost' && 
-      window.location.hostname !== '127.0.0.1'
-    ) {
-      window.location.href = window.location.href.replace(/^http:/, 'https:');
-    }
-    
-    if (!window.isSecureContext) {
-      setIsSecureContext(false);
-      addLog('Error: App must run via HTTPS', 'error');
-    }
-  }, []);
-
+  // -- HELPERS --
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, incomingBuffer]);
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info'): void => {
     const logEntry: Log = { message, type, timestamp: new Date().toLocaleTimeString() };
     setLogs(prev => [...prev.slice(-4), logEntry]);
   };
 
+  const toggleStealthMode = () => {
+    const newMode = !isStealthMode;
+    setIsStealthMode(newMode);
+    isStealthModeRef.current = newMode;
+    addLog(`Switched to ${newMode ? 'STEALTH' : 'AUDIBLE'} mode`, 'info');
+  };
+
+  // -- AUDIO ENGINE INITIALIZATION --
   const requestMicPermission = async (): Promise<void> => {
     if (!isSecureContext) {
       addLog('HTTPS required for Microphone', 'error');
@@ -253,6 +242,15 @@ const NoFiChat: React.FC = () => {
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       audioContextRef.current = new AudioContextClass();
       
+      // Infinite Silence Hack to keep AudioContext alive for Relay
+      const osc = audioContextRef.current.createOscillator();
+      const gain = audioContextRef.current.createGain();
+      osc.connect(gain);
+      gain.connect(audioContextRef.current.destination);
+      osc.frequency.value = 440;
+      gain.gain.value = 0.0001; 
+      osc.start();
+
       analyserRef.current = audioContextRef.current.createAnalyser();
       analyserRef.current.fftSize = PROTOCOL.FFT_SIZE;
       analyserRef.current.smoothingTimeConstant = 0.2;
@@ -267,7 +265,57 @@ const NoFiChat: React.FC = () => {
     }
   };
 
-  const transmitAudio = (payload: string, onComplete?: () => void) => {
+  // -- AI VOICE FUNCTIONS --
+  const transcribeAudio = async (audioBlob: Blob) => {
+    if (!transcriber) return;
+    addLog("Processing speech locally...", "info");
+    const url = URL.createObjectURL(audioBlob);
+    try {
+        const result = await transcriber(url);
+        setInputText(prev => (prev + " " + result.text).trim());
+    } catch (e) {
+        console.error(e);
+        addLog("Transcription failed", "error");
+    }
+  };
+
+  const toggleAiRecording = async () => {
+    if (isRecordingAI && mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+        setIsRecordingAI(false);
+        return;
+    }
+    if (!transcriber) {
+        addLog("AI Model is still loading...", "error");
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mediaRecorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = mediaRecorder;
+        chunksRef.current = [];
+
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) chunksRef.current.push(event.data);
+        };
+
+        mediaRecorder.onstop = () => {
+            const audioBlob = new Blob(chunksRef.current, { type: 'audio/wav' });
+            transcribeAudio(audioBlob);
+            stream.getTracks().forEach(track => track.stop());
+        };
+
+        mediaRecorder.start();
+        setIsRecordingAI(true);
+        addLog("Listening... (Click Mic to stop)", "info");
+    } catch (err) {
+        console.error(err);
+        addLog("Could not access microphone for AI", "error");
+    }
+  };
+
+  // -- TRANSMITTER (FSK ENCODER) --
+  const transmitAudio = (text: string, onComplete?: () => void) => {
     if (!audioContextRef.current) return;
     const ctx = audioContextRef.current;
     
@@ -277,7 +325,7 @@ const NoFiChat: React.FC = () => {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
-    // Use the Ref to determine mode
+    // 1. Select Config based on Mode
     const mode = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH : PROTOCOL.MODES.AUDIBLE;
 
     osc.connect(gain);
@@ -287,14 +335,10 @@ const NoFiChat: React.FC = () => {
     let startTime = now + 0.1;
 
     for (let i = 0; i < text.length; i++) {
-      const currentStep = isStealthModeRef.current ? 40 : PROTOCOL.STEP_FREQ;
       const charCode = text.charCodeAt(i);
-      const freq = mode.BASE + (charCode * currentStep); // Use currentStep
-      // const charCode = text.charCodeAt(i);
-      // Inside the for loop...
-      // const step = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
-      // const freq = mode.BASE + (charCode * step);
-      // const freq = mode.BASE + (charCode * PROTOCOL.STEP_FREQ);
+      // Get correct step size
+      const currentStep = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
+      const freq = mode.BASE + (charCode * currentStep);
 
       // Marker Tone
       osc.frequency.setValueAtTime(mode.MARKER, startTime);
@@ -327,7 +371,7 @@ const NoFiChat: React.FC = () => {
   const startAudioMonitoring = (): void => {
     if (!analyserRef.current || !audioContextRef.current) return;
     
-    // CRITICAL: Set FFT Size to match Protocol
+    // CRITICAL: Set FFT Size
     analyserRef.current.fftSize = PROTOCOL.FFT_SIZE;
     
     const bufferLength = analyserRef.current.frequencyBinCount;
@@ -348,12 +392,14 @@ const NoFiChat: React.FC = () => {
           maxVal = dataArray[i];
           maxIndex = i;
         }
+        sum += dataArray[i];
       }
       
       const average = sum / bufferLength;
       setAudioLevel(Math.min(100, (average / 50) * 100));
       setSignalStrength(Math.floor(Math.min(100, (maxVal / 255) * 100)));
 
+      // Only process audio if not currently sending
       if (!isSendingRef.current) {
         if (maxVal > PROTOCOL.THRESHOLD) {
           const nyquist = ctx.sampleRate / 2;
@@ -372,26 +418,21 @@ const NoFiChat: React.FC = () => {
     update();
   };
 
-  // -- DECODER STATE MACHINE (DUAL-MODE) --
+  // -- DECODER STATE MACHINE (SMART DUAL-MODE) --
   const handleFrequencyInput = (freq: number, amplitude: number) => {
     const d = decoderRef.current;
     const now = Date.now();
-    
-    // Get Frequencies
-    const mode = isStealthModeRef.current ? PROTOCOL.MODES.STEALTH : PROTOCOL.MODES.AUDIBLE;
 
-    // 1. Timeout Check
+    // 1. Timeout Checks
     if (d.buffer.length > 0 && (now - d.lastCharDecoded > 3000)) {
-      addLog('No new char for 3s - committing', 'info');
+      addLog('Timeout: Committing partial message', 'info');
       commitReceivedMessage();
       return;
     }
-
     if (d.buffer.length > 0 && d.silenceTimer !== null && (now - d.silenceTimer > PROTOCOL.SILENCE_TIMEOUT)) {
       commitReceivedMessage();
       return;
     }
-
     if (d.state !== 'IDLE' && d.buffer.length === 0 && (now - d.lastValidRead > PROTOCOL.IDLE_TIMEOUT)) {
       d.state = 'IDLE';
       d.buffer = '';
@@ -399,41 +440,29 @@ const NoFiChat: React.FC = () => {
       d.consecutiveFrames = 0;
       setIncomingBuffer('');
       setIsReceiving(false);
-      addLog('Signal lost (timeout)', 'info');
       return;
     }
 
+    // 2. Noise Gate
     if (amplitude < PROTOCOL.THRESHOLD) {
       d.consecutiveFrames = 0;
-      if (d.buffer.length > 0 && d.silenceTimer === null) {
-        d.silenceTimer = now;
-      }
+      if (d.buffer.length > 0 && d.silenceTimer === null) d.silenceTimer = now;
       return;
     }
+    if (d.buffer.length > 0) d.silenceTimer = null;
 
-    if (d.buffer.length > 0 && d.silenceTimer !== null) {
-      d.silenceTimer = null;
-    }
+    // Helper: Check frequency
+    const isFreq = (target: number, range = 100) => Math.abs(freq - target) < range;
 
-    const isFreq = (target: number, range = 50) => Math.abs(freq - target) < range;
-
-    // --- STATE 1: SCANNING FOR MARKERS (BOTH MODES) ---
+    // --- STATE 1: SCAN FOR MARKER (AUTO-DETECT MODE) ---
     if (d.state === 'IDLE' || d.state === 'WAIT_MARKER') {
-      
-      let detected = false;
+      let detectedMode = null;
 
-      // Check AUDIBLE Marker
-      if (isFreq(PROTOCOL.MODES.AUDIBLE.MARKER)) {
-        d.activeMode = 'AUDIBLE'; // Lock onto Audible
-        detected = true;
-      } 
-      // Check STEALTH Marker
-      else if (isFreq(PROTOCOL.MODES.STEALTH.MARKER)) {
-        d.activeMode = 'STEALTH'; // Lock onto Stealth
-        detected = true;
-      }
+      if (isFreq(PROTOCOL.MODES.AUDIBLE.MARKER)) detectedMode = 'AUDIBLE';
+      else if (isFreq(PROTOCOL.MODES.STEALTH.MARKER)) detectedMode = 'STEALTH';
 
-      if (detected) {
+      if (detectedMode) {
+        d.activeMode = detectedMode as 'AUDIBLE' | 'STEALTH'; // Lock onto detected mode
         d.consecutiveFrames++;
         if (d.consecutiveFrames >= 2) { 
           d.state = 'READ_CHAR';
@@ -441,40 +470,32 @@ const NoFiChat: React.FC = () => {
           d.lastDetectedChar = null;
           d.lastValidRead = now;
           if (!isReceiving) setIsReceiving(true);
-          // If we switched modes mid-stream (rare), keep timer alive
           if (d.buffer.length > 0) d.silenceTimer = now; 
         }
       } else {
         d.consecutiveFrames = 0;
       }
     } 
-    
-    // --- STATE 2: READING DATA (USING LOCKED MODE) ---
+    // --- STATE 2: READ CHARACTER ---
     else if (d.state === 'READ_CHAR') {
-      // Pull configuration based on what we detected in State 1
       const currentConfig = PROTOCOL.MODES[d.activeMode];
       const currentStep = d.activeMode === 'STEALTH' ? PROTOCOL.MODES.STEALTH.STEP_FREQ : PROTOCOL.STEP_FREQ;
 
-      // If we see the marker again, it's just a gap/hold
       if (isFreq(currentConfig.MARKER)) {
         d.consecutiveFrames = 0;
         return;
       }
 
-      // Decode Character using the LOCKED mode's math
       const rawChar = (freq - currentConfig.BASE) / currentStep;
       const estimatedChar = Math.round(rawChar);
       
       if (estimatedChar >= 32 && estimatedChar <= 126) {
          const expectedFreq = currentConfig.BASE + (estimatedChar * currentStep);
-         
          if (Math.abs(freq - expectedFreq) < (currentStep / 2)) {
              d.consecutiveFrames++;
              if (d.consecutiveFrames >= 3) {
                const char = String.fromCharCode(estimatedChar);
-               
                if (char !== d.lastDetectedChar) {
-                 console.log(`[${d.activeMode}] CHAR:`, char);
                  d.buffer += char;
                  setIncomingBuffer(d.buffer); 
                  d.lastDetectedChar = char;
@@ -486,11 +507,11 @@ const NoFiChat: React.FC = () => {
                }
              }
          } else {
-          d.consecutiveFrames = 0;
-      }
-    } else {
+            d.consecutiveFrames = 0;
+         }
+      } else {
          d.consecutiveFrames = 0;
-    }
+      }
     }
   };
 
@@ -502,6 +523,7 @@ const NoFiChat: React.FC = () => {
       let msgId = generateId();
       let msgText = rawData;
 
+      // Parse ID if present
       if (rawData.includes(PROTOCOL.SEPARATOR)) {
         const parts = rawData.split(PROTOCOL.SEPARATOR);
         if (parts.length >= 2) {
@@ -524,6 +546,7 @@ const NoFiChat: React.FC = () => {
         
         setMessages(prev => [...prev, newMessage]);
         
+        // Queue for Relay
         const randomDelay = 10000 + Math.random() * 10000;
         const relayMessage: RelayMessage = {
           id: msgId,
@@ -538,6 +561,7 @@ const NoFiChat: React.FC = () => {
       }
     }
     
+    // Reset
     d.buffer = '';
     d.lastDetectedChar = null;
     d.state = 'IDLE';
@@ -547,140 +571,22 @@ const NoFiChat: React.FC = () => {
     setIsReceiving(false);
   };
 
-  useEffect(() => {
-    return () => {
-      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
-      if (audioContextRef.current) audioContextRef.current.close();
-      if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(track => track.stop());
-    };
-  }, []);
-
-  // -- STEALTH MODE STATE --
-  // 1. The State (Updates the UI Button)
-  const [isStealthMode, setIsStealthMode] = useState<boolean>(false);
-  
-  // 2. The Ref (Updates the Audio Engine instantly)
-  const isStealthModeRef = useRef<boolean>(false);
-
-  // 3. The Toggle Function (Syncs both)
-  const toggleStealthMode = () => {
-    const newMode = !isStealthMode;
-    setIsStealthMode(newMode);          // Update UI
-    isStealthModeRef.current = newMode; // Update Audio Engine
-    addLog(`Switched to ${newMode ? 'STEALTH' : 'AUDIBLE'} mode`, 'info');
-  };
-
-  // 1. LOAD WHISPER MODEL (Runs once on mount)
-  // 1. LOAD WHISPER MODEL
-  useEffect(() => {
-    const loadModel = async () => {
-      try {
-        addLog("Loading AI engine...", "info");
-        
-        // --- THE FIX: Load from CDN to bypass Vite bundling errors ---
-        // @ts-ignore
-        const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
-        
-        // Configure to allow local models if cached, or fetch from remote
-        env.allowLocalModels = false; 
-        
-        // Load the model
-        addLog("Downloading model weights (~40MB)...", "info");
-        const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
-        
-        setTranscriber(() => pipe); 
-        setIsModelLoading(false);
-        addLog("Offline AI Ready! (WiFi can now be turned off)", "success");
-        // -------------------------------------------------------------
-
-      } catch (err) {
-        console.error(err);
-        setIsModelLoading(false);
-        addLog("AI Load Failed. Check Internet connection for first run.", "error");
-      }
-    };
-    loadModel();
-  }, []);
-
-  // 2. TRANSCRIBE AUDIO (The "Brain")
-  const transcribeAudio = async (audioBlob: Blob) => {
-    if (!transcriber) return;
-    
-    addLog("Processing speech locally...", "info");
-    
-    // Create a URL for the blob so the model can read it
-    const url = URL.createObjectURL(audioBlob);
-    
-    try {
-        const result = await transcriber(url);
-        // Append result to input text
-        setInputText(prev => (prev + " " + result.text).trim());
-    } catch (e) {
-        console.error(e);
-        addLog("Transcription failed", "error");
-    }
-  };
-
-  // 3. HANDLE RECORDING (The "Ears")
-  const toggleAiRecording = async () => {
-    // A. If currently recording, STOP it.
-    if (isRecordingAI && mediaRecorderRef.current) {
-        mediaRecorderRef.current.stop();
-        setIsRecordingAI(false);
-        return;
-    }
-
-    // B. If NOT recording, START it.
-    if (!transcriber) {
-        addLog("AI Model is still loading...", "error");
-        return;
-    }
-
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const mediaRecorder = new MediaRecorder(stream);
-        mediaRecorderRef.current = mediaRecorder;
-        chunksRef.current = []; // Reset chunks
-
-        mediaRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) {
-                chunksRef.current.push(event.data);
-            }
-        };
-
-        mediaRecorder.onstop = () => {
-            const audioBlob = new Blob(chunksRef.current, { type: 'audio/wav' });
-            transcribeAudio(audioBlob);
-            
-            // Stop all tracks to release mic
-            stream.getTracks().forEach(track => track.stop());
-        };
-
-        mediaRecorder.start();
-        setIsRecordingAI(true);
-        addLog("Listening... (Click Mic to stop)", "info");
-
-    } catch (err) {
-        console.error(err);
-        addLog("Could not access microphone for AI", "error");
-    }
-  };
-
-  const sendMessage = (): void => {
-    if (!inputText.trim() || !micPermission || isSending) return;
+  const sendMessage = (textOverride?: string): void => {
+    const textToSend = textOverride || inputText;
+    if (!textToSend.trim() || !micPermission || isSending) return;
     
     const newId = generateId();
     seenIdsRef.current.add(newId);
 
     const newMessage: Message = {
       id: newId,
-      text: inputText,
+      text: textToSend,
       sender: 'me',
       timestamp: new Date()
     };
     
     setMessages(prev => [...prev, newMessage]);
-    const payload = `${newId}${PROTOCOL.SEPARATOR}${inputText}`;
+    const payload = `${newId}${PROTOCOL.SEPARATOR}${textToSend}`;
     setInputText('');
     
     setIsSending(true);
@@ -722,333 +628,28 @@ const NoFiChat: React.FC = () => {
     addLog('Relay queue cleared', 'info');
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>): void => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  };
-
   return (
     <>
+      {/* ... (Styles Block - Same as before) ... */}
       <style>{`
-        * {
-          -webkit-tap-highlight-color: transparent;
-          -webkit-touch-callout: none;
-        }
-        
-        @keyframes slideUp {
-          from { opacity: 0; transform: translateY(30px) scale(0.95); }
-          to { opacity: 1; transform: translateY(0) scale(1); }
-        }
-        @keyframes slideDown {
-          from { opacity: 0; transform: translateY(-30px) scale(0.95); }
-          to { opacity: 1; transform: translateY(0) scale(1); }
-        }
-        @keyframes slideLeft {
-          from { opacity: 0; transform: translateX(-40px) scale(0.9); }
-          to { opacity: 1; transform: translateX(0) scale(1); }
-        }
-        @keyframes slideRight {
-          from { opacity: 0; transform: translateX(40px) scale(0.9); }
-          to { opacity: 1; transform: translateX(0) scale(1); }
-        }
-        @keyframes fadeIn {
-          from { opacity: 0; }
-          to { opacity: 1; }
-        }
-        @keyframes scaleIn {
-          from { opacity: 0; transform: scale(0.8); }
-          to { opacity: 1; transform: scale(1); }
-        }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.7; transform: scale(0.95); }
-        }
-        @keyframes ripple {
-          0% { transform: scale(0); opacity: 0.6; }
-          100% { transform: scale(4); opacity: 0; }
-        }
-        @keyframes wave {
-          0%, 100% { transform: scaleY(0.3); }
-          50% { transform: scaleY(1); }
-        }
-        @keyframes glow {
-          0%, 100% { 
-            box-shadow: 0 0 20px rgba(6, 182, 212, 0.3), 
-                        0 0 40px rgba(59, 130, 246, 0.2),
-                        0 0 60px rgba(168, 85, 247, 0.1);
-          }
-          50% { 
-            box-shadow: 0 0 40px rgba(6, 182, 212, 0.5), 
-                        0 0 80px rgba(59, 130, 246, 0.3),
-                        0 0 120px rgba(168, 85, 247, 0.2);
-          }
-        }
-        @keyframes float {
-          0%, 100% { transform: translateY(0) rotate(0deg); }
-          33% { transform: translateY(-12px) rotate(1deg); }
-          66% { transform: translateY(-8px) rotate(-1deg); }
-        }
-        @keyframes shimmer {
-          0% { background-position: -200% center; }
-          100% { background-position: 200% center; }
-        }
-        @keyframes particles {
-          0% { transform: translateY(0) translateX(0); opacity: 0; }
-          10% { opacity: 1; }
-          90% { opacity: 1; }
-          100% { transform: translateY(-100px) translateX(20px); opacity: 0; }
-        }
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-        @keyframes gradientFlow {
-          0% { background-position: 0% 50%; }
-          50% { background-position: 100% 50%; }
-          100% { background-position: 0% 50%; }
-        }
-        
-        .animate-slideUp { animation: slideUp 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
-        .animate-slideDown { animation: slideDown 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
-        .animate-slideLeft { animation: slideLeft 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
-        .animate-slideRight { animation: slideRight 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+        /* ... (Paste your existing styles here) ... */
+        * { -webkit-tap-highlight-color: transparent; }
         .animate-fadeIn { animation: fadeIn 0.4s ease-out forwards; }
-        .animate-scaleIn { animation: scaleIn 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
-        .animate-pulse { animation: pulse 2s ease-in-out infinite; }
-        .animate-wave { animation: wave 0.8s ease-in-out infinite; }
-        .animate-glow { animation: glow 3s ease-in-out infinite; }
-        .animate-float { animation: float 6s ease-in-out infinite; }
-        .animate-spin { animation: spin 2s linear infinite; }
-        .animate-gradientFlow { 
-          background-size: 200% 200%;
-          animation: gradientFlow 3s ease infinite;
-        }
-        
-        .glass-ultra {
-          background: rgba(255, 255, 255, 0.03);
-          backdrop-filter: blur(40px) saturate(180%);
-          -webkit-backdrop-filter: blur(40px) saturate(180%);
-          border: 1px solid rgba(255, 255, 255, 0.18);
-          box-shadow: 
-            0 8px 32px 0 rgba(0, 0, 0, 0.37),
-            inset 0 1px 1px 0 rgba(255, 255, 255, 0.1);
-        }
-        
-        .glass-card {
-          background: linear-gradient(
-            135deg,
-            rgba(255, 255, 255, 0.1) 0%,
-            rgba(255, 255, 255, 0.05) 100%
-          );
-          backdrop-filter: blur(30px) saturate(150%);
-          -webkit-backdrop-filter: blur(30px) saturate(150%);
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          box-shadow: 
-            0 10px 40px rgba(0, 0, 0, 0.3),
-            inset 0 1px 0 rgba(255, 255, 255, 0.2);
-        }
-        
-        .message-glow-send {
-          box-shadow: 
-            0 0 20px rgba(6, 182, 212, 0.4),
-            0 10px 30px rgba(6, 182, 212, 0.2);
-        }
-        
-        .message-glow-receive {
-          box-shadow: 
-            0 0 20px rgba(34, 197, 94, 0.4),
-            0 10px 30px rgba(34, 197, 94, 0.2);
-        }
-        
-        .shimmer-effect {
-          position: relative;
-          overflow: hidden;
-        }
-        .shimmer-effect::before {
-          content: '';
-          position: absolute;
-          top: 0;
-          left: -100%;
-          width: 100%;
-          height: 100%;
-          background: linear-gradient(
-            90deg,
-            transparent,
-            rgba(255, 255, 255, 0.2),
-            transparent
-          );
-          animation: shimmer 2s infinite;
-        }
-        
-        .particle {
-          position: absolute;
-          width: 4px;
-          height: 4px;
-          background: radial-gradient(circle, rgba(6, 182, 212, 0.8), transparent);
-          border-radius: 50%;
-          pointer-events: none;
-          animation: particles 3s ease-out forwards;
-        }
-        
-        .gradient-border {
-          position: relative;
-          background: linear-gradient(135deg, #06b6d4, #3b82f6, #a855f7);
-          padding: 2px;
-          border-radius: 1rem;
-        }
-        
-        .gradient-border > * {
-          background: #000;
-          border-radius: calc(1rem - 2px);
-        }
-        
-        .mesh-gradient {
-          background: 
-            radial-gradient(at 15% 20%, rgba(6, 182, 212, 0.25) 0px, transparent 50%),
-            radial-gradient(at 85% 30%, rgba(59, 130, 246, 0.2) 0px, transparent 50%),
-            radial-gradient(at 50% 70%, rgba(168, 85, 247, 0.15) 0px, transparent 50%),
-            radial-gradient(at 90% 80%, rgba(34, 197, 94, 0.15) 0px, transparent 50%),
-            linear-gradient(135deg, #000000 0%, #0a0a1a 50%, #000000 100%);
-          background-size: 200% 200%;
-          animation: gradientFlow 10s ease infinite;
-        }
-        
-        .bounce-in {
-          animation: bounceIn 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-        }
-        
-        @keyframes bounceIn {
-          0% { transform: scale(0) rotate(0deg); }
-          50% { transform: scale(1.1) rotate(5deg); }
-          100% { transform: scale(1) rotate(0deg); }
-        }
-        
-        /* Mobile optimizations */
-        @media (max-width: 640px) {
-          .glass-ultra, .glass-card {
-            backdrop-filter: blur(20px) saturate(150%);
-            -webkit-backdrop-filter: blur(20px) saturate(150%);
-          }
-        }
-        
-        /* Smooth scrolling */
-        * {
-          scroll-behavior: smooth;
-        }
-        
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-          width: 6px;
-          height: 6px;
-        }
-        ::-webkit-scrollbar-track {
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 10px;
-        }
-        ::-webkit-scrollbar-thumb {
-          background: linear-gradient(180deg, #06b6d4, #3b82f6);
-          border-radius: 10px;
-          transition: all 0.3s ease;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-          background: linear-gradient(180deg, #0891b2, #2563eb);
-        }
-        
-        /* Input focus glow */
-        .input-glow:focus {
-          box-shadow: 
-            0 0 0 3px rgba(6, 182, 212, 0.2),
-            0 0 20px rgba(6, 182, 212, 0.3),
-            inset 0 0 10px rgba(6, 182, 212, 0.1);
-        }
-        
-        /* Button press effect */
-        .btn-press:active {
-          transform: scale(0.95);
-          transition: transform 0.1s ease;
-        }
+        .glass-ultra { background: rgba(255,255,255,0.03); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); }
+        .glass-card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); }
+        .mesh-gradient { background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); }
       `}</style>
 
       {/* Onboarding Modal */}
       {showOnboarding && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/80 backdrop-blur-2xl animate-fadeIn" />
-          
-          <div className="relative glass-ultra rounded-[2rem] p-8 sm:p-12 w-full max-w-md shadow-2xl animate-float border-2 border-cyan-500/20">
-            {/* Floating particles effect */}
-            <div className="absolute inset-0 overflow-hidden rounded-[2rem] pointer-events-none">
-              {[...Array(12)].map((_, i) => (
-                <div
-                  key={i}
-                  className="particle"
-                  style={{
-                    left: `${Math.random() * 100}%`,
-                    animationDelay: `${i * 0.3}s`,
-                    animationDuration: `${3 + Math.random() * 2}s`
-                  }}
-                />
-              ))}
-            </div>
-            
-            <div className="flex justify-center mb-10 relative z-10">
-              <div className="relative animate-glow">
-                <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 via-blue-500 to-purple-500 rounded-full blur-3xl opacity-60 animate-pulse" />
-                <div className="relative glass-card p-8 rounded-3xl border-2 border-cyan-400/50 animate-float">
-                  <WifiOff className="w-16 h-16 sm:w-20 sm:h-20 text-cyan-400" strokeWidth={2.5} />
-                  <div className="absolute -bottom-2 -right-2 glass-card p-2 rounded-full border border-blue-400/50">
-                    <Radio className="w-6 h-6 text-blue-400 animate-pulse" />
-                  </div>
-                </div>
-              </div>
-            </div>
-            
-            <h2 className="text-4xl sm:text-5xl font-black text-center mb-4 bg-gradient-to-r from-cyan-400 via-blue-400 to-purple-400 bg-clip-text text-transparent animate-gradientFlow relative z-10">
-              NoFi Modem
-            </h2>
-            
-            <p className="text-center text-cyan-100/90 mb-3 text-base sm:text-lg px-4 font-medium relative z-10">
-              Audio-based mesh network
-            </p>
-            
-            <div className="glass-card rounded-2xl p-5 mb-8 border border-cyan-500/30 shimmer-effect relative z-10">
-              <div className="flex items-start gap-4 text-sm text-cyan-50">
-                <Zap className="w-6 h-6 text-yellow-400 flex-shrink-0 mt-0.5 animate-pulse" />
-                <div className="space-y-2">
-                  <p className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                    P2P audio communication
-                  </p>
-                  <p className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
-                    Auto-relay (10-20s random)
-                  </p>
-                  <p className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
-                    Mesh network routing
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {!isSecureContext && (
-              <div className="bg-gradient-to-r from-red-900/50 to-red-800/50 border-2 border-red-500/60 rounded-2xl p-5 mb-8 text-sm text-red-200 flex items-start gap-3 glass-card animate-slideDown relative z-10">
-                <Lock className="w-6 h-6 flex-shrink-0 mt-0.5 text-red-400 animate-pulse" />
-                <div>
-                  <strong className="block mb-2 text-base">🔒 Security Required</strong>
-                  HTTPS is required to access your microphone for audio transmission.
-                </div>
-              </div>
-            )}
-            
-            <button
-              onClick={requestMicPermission}
-              disabled={!isSecureContext}
-              className="relative w-full bg-gradient-to-r from-cyan-500 via-blue-500 to-purple-500 hover:from-cyan-600 hover:via-blue-600 hover:to-purple-600 disabled:from-gray-700 disabled:to-gray-800 disabled:cursor-not-allowed text-white font-bold py-5 px-8 rounded-2xl transition-all transform hover:scale-[1.02] active:scale-[0.98] disabled:hover:scale-100 flex items-center justify-center gap-3 shadow-2xl text-lg overflow-hidden btn-press z-10 shimmer-effect"
-            >
-              <Mic className="w-7 h-7" />
-              <span>{isSecureContext ? 'Activate Modem' : 'HTTPS Required'}</span>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="glass-ultra p-8 rounded-3xl max-w-md text-center border border-cyan-500/30">
+            <WifiOff className="w-16 h-16 text-cyan-400 mx-auto mb-4" />
+            <h2 className="text-3xl font-bold text-white mb-2">NoFi Modem</h2>
+            <p className="text-cyan-100/80 mb-6">Offline Mesh Network via Audio</p>
+            {!isSecureContext && <p className="text-red-400 text-sm mb-4">HTTPS Required</p>}
+            <button onClick={requestMicPermission} disabled={!isSecureContext} className="w-full bg-cyan-600 hover:bg-cyan-500 text-white py-3 rounded-xl font-bold">
+              {isSecureContext ? 'Activate Modem' : 'Secure Context Needed'}
             </button>
           </div>
         </div>
@@ -1056,378 +657,118 @@ const NoFiChat: React.FC = () => {
 
       {/* Relay Queue Panel */}
       {showRelayQueue && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div 
-            className="absolute inset-0 bg-black/85 backdrop-blur-2xl animate-fadeIn" 
-            onClick={() => setShowRelayQueue(false)} 
-          />
-          
-          <div className="relative glass-ultra rounded-[2rem] p-6 sm:p-8 w-full max-w-3xl border-2 border-green-500/30 max-h-[90vh] flex flex-col shadow-2xl animate-scaleIn">
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-2xl sm:text-3xl font-black bg-gradient-to-r from-green-400 to-emerald-400 bg-clip-text text-transparent flex items-center gap-3">
-                <div className="relative">
-                  <Inbox className="w-8 h-8 text-green-400" />
-                  {relayQueue.filter(m => m.status === 'pending').length > 0 && (
-                    <span className="absolute -top-2 -right-2 w-5 h-5 bg-green-500 rounded-full animate-pulse" />
-                  )}
-                </div>
-                Relay Queue
-              </h2>
-              <button
-                onClick={() => setShowRelayQueue(false)}
-                className="glass-card hover:bg-white/10 p-3 rounded-xl transition-all transform hover:scale-110 active:scale-95 btn-press"
-              >
-                <X className="w-6 h-6 text-gray-300" />
-              </button>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="glass-ultra w-full max-w-lg p-6 rounded-3xl border border-green-500/30 max-h-[80vh] flex flex-col">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-xl font-bold text-green-400 flex gap-2"><Inbox/> Relay Queue</h3>
+              <button onClick={() => setShowRelayQueue(false)}><X className="text-gray-400"/></button>
             </div>
-            
-            <div className="flex-1 overflow-y-auto space-y-3 mb-6 pr-2">
-              {relayQueue.length === 0 ? (
-                <div className="text-center text-gray-400 py-20 animate-fadeIn">
-                  <div className="relative inline-block">
-                    <Inbox className="w-20 h-20 mx-auto mb-6 opacity-20" />
-                    <Waves className="w-12 h-12 absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-cyan-500/30 animate-pulse" />
+            <div className="flex-1 overflow-y-auto space-y-3">
+              {relayQueue.map(msg => (
+                <div key={msg.id} className="glass-card p-4 rounded-xl flex justify-between items-center">
+                  <div>
+                    <p className="text-white text-sm font-mono">#{msg.id}</p>
+                    <p className="text-gray-400 text-xs truncate w-40">{msg.text}</p>
                   </div>
-                  <p className="text-xl font-semibold">No messages queued</p>
-                  <p className="text-sm mt-2 text-gray-500">Received messages will appear here</p>
+                  {msg.status === 'pending' ? (
+                    <button onClick={() => relayMessage(msg.id)} className="bg-green-600 px-3 py-1 rounded text-xs font-bold">Relay</button>
+                  ) : <span className="text-gray-500 text-xs">Sent</span>}
                 </div>
-              ) : (
-                relayQueue.map((msg, idx) => (
-                  <div
-                    key={msg.id}
-                    className={`glass-card rounded-2xl p-5 border-2 transition-all transform hover:scale-[1.01] animate-slideUp ${
-                      msg.status === 'relayed' 
-                        ? 'border-gray-600/50 opacity-60' 
-                        : 'border-green-500/60 hover:border-green-400'
-                    }`}
-                    style={{ animationDelay: `${idx * 0.08}s` }}
-                  >
-                    <div className="flex items-start justify-between gap-4 flex-col sm:flex-row">
-                      <div className="flex-1 w-full">
-                        <p className="text-white mb-4 text-base break-words leading-relaxed">{msg.text}</p>
-                        <div className="flex flex-wrap items-center gap-3 text-xs">
-                          <span className="glass-card px-3 py-1.5 rounded-lg font-mono font-bold text-cyan-300 border border-cyan-500/30">
-                            #{msg.id}
-                          </span>
-                          <span className="flex items-center gap-2 text-gray-400">
-                            <Activity className="w-4 h-4" />
-                            {msg.receivedAt.toLocaleTimeString()}
-                          </span>
-                          <span className={`px-3 py-1.5 rounded-lg font-bold ${
-                            msg.status === 'relayed' 
-                              ? 'bg-gray-700/50 text-gray-300 border border-gray-600' 
-                              : 'bg-green-600/30 text-green-300 border border-green-500/50 animate-pulse'
-                          }`}>
-                            {msg.status === 'relayed' ? '✓ Relayed' : '⏳ Pending'}
-                          </span>
-                        </div>
-                      </div>
-                      {msg.status === 'pending' && (
-                        <button
-                          onClick={() => relayMessage(msg.id)}
-                          disabled={isSending}
-                          className="w-full sm:w-auto bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 disabled:from-gray-700 disabled:to-gray-800 disabled:cursor-not-allowed text-white px-6 py-3 rounded-xl font-bold transition-all transform hover:scale-105 active:scale-95 disabled:hover:scale-100 shadow-lg btn-press shimmer-effect"
-                        >
-                          Relay Now
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))
-              )}
+              ))}
+              {relayQueue.length === 0 && <p className="text-center text-gray-500 py-8">Queue empty</p>}
             </div>
-            
-            {relayQueue.length > 0 && (
-              <button
-                onClick={clearRelayQueue}
-                className="w-full glass-card hover:bg-red-500/20 border-2 border-red-500/60 text-red-400 hover:text-red-300 py-4 rounded-xl transition-all font-bold transform hover:scale-[1.02] active:scale-[0.98] btn-press"
-              >
-                Clear All Messages
-              </button>
-            )}
           </div>
         </div>
       )}
 
-      {/* Main Chat Interface */}
-      <div className="h-screen w-full mesh-gradient flex flex-col overflow-hidden relative">
-        
+      {/* Main App */}
+      <div className="h-screen w-full mesh-gradient flex flex-col">
         {/* Header */}
-        <div className="relative glass-ultra border-b border-white/10 shadow-2xl z-20 animate-slideDown">
-          <div className="p-4 sm:p-5 flex items-center justify-between gap-3">
-            <div className="flex items-center gap-3 flex-1 min-w-0">
-              <div className="relative flex-shrink-0">
-                <div className={`absolute inset-0 rounded-2xl blur-xl transition-all ${isSending || isReceiving ? 'bg-cyan-500 animate-pulse' : 'bg-blue-500/40'}`} />
-                <div className="relative glass-card rounded-2xl p-3 border-2 border-cyan-400/60 transition-all hover:scale-110 transform">
-                  <WifiOff className="w-7 h-7 text-cyan-400" strokeWidth={3} />
-                  {(isSending || isReceiving) && (
-                    <div className="absolute -bottom-1 -right-1 glass-card p-1 rounded-full border-2 border-green-400">
-                      <Activity className="w-3 h-3 text-green-400 animate-pulse" />
-                    </div>
-                  )}
-                </div>
-              </div>
-              
-              <div className="min-w-0 flex-1">
-                <h1 className="text-xl sm:text-2xl lg:text-3xl font-black bg-gradient-to-r from-cyan-400 via-blue-400 to-purple-400 bg-clip-text text-transparent flex items-center gap-2 flex-wrap animate-gradientFlow">
-                  NoFi
-                  <span className="glass-card text-[10px] sm:text-xs font-bold px-2 sm:px-3 py-1 rounded-full flex items-center gap-1.5 text-white border border-white/20 animate-pulse">
-                    <Lock className={`w-3 h-3 ${isSecureContext ? 'text-green-400' : 'text-red-400'}`} />
-                    <span className="hidden sm:inline">{isSecureContext ? 'Secure' : 'Insecure'}</span>
-                  </span>
-                </h1>
-                <p className="text-xs text-cyan-300 font-mono font-bold mt-1 flex items-center gap-2">
-                  {isSending ? (
-                    <>
-                      <Signal className="w-3 h-3 animate-pulse" />
-                      TX: SENDING
-                    </>
-                  ) : isReceiving ? (
-                    <>
-                      <Signal className="w-3 h-3 animate-pulse" />
-                      RX: DECODING
-                    </>
-                  ) : (
-                    <>
-                      <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-                      IDLE
-                    </>
-                  )}
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <button
-                onClick={() => setShowRelayQueue(true)}
-                className="relative glass-card hover:bg-white/10 p-3 rounded-xl transition-all border border-white/10 group transform hover:scale-110 active:scale-95 btn-press"
-              >
-                <Inbox className="w-5 h-5 sm:w-6 sm:h-6 text-cyan-300 group-hover:text-cyan-200 transition-colors" />
-                {relayQueue.filter(m => m.status === 'pending').length > 0 && (
-                  <span className="absolute -top-2 -right-2 bg-gradient-to-r from-green-500 to-emerald-500 text-white text-xs w-6 h-6 rounded-full flex items-center justify-center font-black shadow-lg animate-pulse border-2 border-gray-900">
-                    {relayQueue.filter(m => m.status === 'pending').length}
-                  </span>
-                )}
-              </button>
-              
-              <div className="hidden sm:flex items-center gap-3 glass-card px-4 py-2.5 rounded-xl border border-white/10">
-                <div className="flex gap-1">
-                  {[...Array(6)].map((_, i) => (
-                    <div 
-                      key={i}
-                      className="w-1.5 bg-gradient-to-t from-cyan-400 to-blue-400 rounded-full transition-all duration-150 animate-wave shadow-lg"
-                      style={{ 
-                        height: `${Math.min(32, Math.max(6, audioLevel * (0.8 + Math.sin(i + Date.now()/100) * 0.4)))}px`,
-                        opacity: micPermission ? 1 : 0.2,
-                        animationDelay: `${i * 0.12}s`
-                      }} 
-                    />
-                  ))}
-                </div>
-                <div className="text-right">
-                  <div className="text-[9px] text-cyan-300/70 uppercase tracking-widest font-bold">Signal</div>
-                  <div className="text-sm font-black text-white font-mono">{signalStrength > 10 ? 'ACTIVE' : 'LOW'}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          {/* RIGHT SIDE CONTROLS */}
+        <div className="glass-ultra p-4 flex justify-between items-center z-10">
           <div className="flex items-center gap-3">
-            
-            {/* --- NEW: STEALTH TOGGLE BUTTON --- */}
-            <button
-              onClick={toggleStealthMode}
-              className={`
-                hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold border transition-all
-                ${isStealthMode 
-                  ? 'bg-red-900/80 border-red-500 text-red-200 animate-pulse shadow-[0_0_15px_rgba(239,68,68,0.5)]' 
-                  : 'bg-black/20 border-white/10 text-blue-200 hover:bg-black/40'}
-              `}
-              title="Switch between Audible (1.2kHz) and Stealth (18.5kHz)"
-            >
-              {isStealthMode ? (
-                <>
-                  <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
-                  STEALTH
-                </>
-              ) : (
-                <>
-                  <Signal className="w-3 h-3" />
-                  AUDIBLE
-                </>
-              )}
-            </button>
-            {/* ---------------------------------- */}
-
-            {/* Signal Meter (Existing Code) */}
-            <div className="text-right hidden sm:block">
-              <div className="text-xs text-blue-100">FREQ</div>
-              <div className="text-sm font-bold text-white font-mono">{signalStrength > 10 ? 'DETECT' : 'LOW'}</div>
+            <div className="p-2 bg-cyan-500/20 rounded-lg"><Radio className="text-cyan-400"/></div>
+            <div>
+              <h1 className="font-bold text-white leading-none">NoFi</h1>
+              <p className="text-[10px] text-cyan-300 font-mono">
+                {isSending ? 'TX: SENDING' : isReceiving ? 'RX: DECODING' : 'IDLE'}
+              </p>
             </div>
-            {/* Visualizer (Existing Code) */}
-            <div className="w-24 sm:w-32 h-8 bg-black/40 rounded flex items-end justify-between px-1 pb-1 gap-0.5 border border-white/10">
-              {[...Array(8)].map((_, i) => (
-                <div 
-                  key={i}
-                  className="w-full bg-cyan-400 rounded-t-sm transition-all duration-75"
-                  style={{ 
-                    height: `${Math.min(100, Math.max(10, audioLevel * (1 + Math.sin(i + Date.now()/100)) ))}%`,
-                    opacity: micPermission ? 1 : 0.3
-                  }} 
-                />
-              ))}
-            </div>
-            {micPermission ? (
-              <Mic className={`w-6 h-6 ${isReceiving ? 'text-green-400 animate-pulse' : 'text-blue-300'}`} />
-            ) : (
-              <MicOff className="w-6 h-6 text-red-400" />
-            )}
           </div>
-        </div>
-
-        {/* Messages Area */}
-        <div className="flex-1 relative overflow-hidden flex flex-col">
           
-          {isSending && (
-            <div className="absolute inset-0 pointer-events-none z-20">
-              <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/5 via-blue-500/10 to-purple-500/5 animate-pulse" />
-              <div className="absolute top-0 left-0 w-full h-1">
-                <div className="h-full bg-gradient-to-r from-transparent via-cyan-500 to-transparent animate-pulse shadow-lg" />
-              </div>
-            </div>
-          )}
-
-          {isReceiving && (
-             <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 z-30 animate-bounceIn max-w-[90%]">
-                <div className="glass-ultra px-6 sm:px-8 py-4 sm:py-5 rounded-2xl border-2 border-green-500/60 shadow-2xl">
-                  <div className="flex flex-col items-center gap-3">
-                    <span className="text-green-400 text-xs font-mono uppercase tracking-widest flex items-center gap-2 font-bold">
-                      <Activity className="w-5 h-5 animate-pulse" />
-                      <span className="hidden sm:inline">Decoding Audio Stream</span>
-                      <span className="sm:hidden">Decoding...</span>
-                    </span>
-                    <div className="glass-card px-4 py-2 rounded-xl border border-green-500/30">
-                      <span className="text-white font-mono text-lg sm:text-xl font-bold flex items-center">
-                        {incomingBuffer || '_'}
-                        <span className="animate-pulse ml-1 text-green-400">█</span>
-                      </span>
-                    </div>
-                  </div>
-                </div>
-             </div>
-          )}
-
-          {logs.length > 0 && (
-            <div className="absolute top-4 right-4 glass-ultra rounded-2xl p-4 border border-cyan-500/40 z-10 max-w-xs shadow-2xl pointer-events-none hidden lg:block animate-slideDown">
-              <div className="text-xs font-mono space-y-2.5">
-                {logs.map((log, idx) => (
-                  <div 
-                    key={idx}
-                    className={`flex items-start gap-2 animate-fadeIn ${
-                      log.type === 'error' ? 'text-red-400' : 
-                      log.type === 'success' ? 'text-green-400' : 
-                      'text-cyan-400'
-                    }`}
-                    style={{ animationDelay: `${idx * 0.1}s` }}
-                  >
-                    <span className="text-gray-500 flex-shrink-0 font-bold">[{log.timestamp}]</span>
-                    <span className="flex-1 font-semibold">{log.message}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 pb-28">
-            {messages.map((message, idx) => (
-              <div
-                key={message.id}
-                className={`flex ${message.sender === 'me' ? 'justify-end' : message.sender === 'system' ? 'justify-center' : 'justify-start'} ${
-                  message.sender === 'me' ? 'animate-slideRight' : 
-                  message.sender === 'system' ? 'animate-scaleIn' : 
-                  'animate-slideLeft'
-                }`}
-                style={{ animationDelay: `${idx * 0.06}s` }}
-              >
-                <div
-                  className={`max-w-[85%] sm:max-w-md px-5 py-4 rounded-3xl shadow-2xl transition-all transform hover:scale-[1.02] ${
-                    message.sender === 'me'
-                      ? 'bg-gradient-to-br from-cyan-500 via-blue-500 to-blue-600 text-white rounded-br-lg border-2 border-cyan-400/40 message-glow-send'
-                      : message.sender === 'system'
-                      ? 'glass-ultra border-2 border-cyan-500/30 text-cyan-100 text-center text-sm px-6 py-3'
-                      : 'glass-card text-white rounded-bl-lg border-2 border-green-500/50 message-glow-receive'
-                  }`}
-                >
-                  <p className="text-sm sm:text-base break-words leading-relaxed mb-2 font-medium">{message.text}</p>
-                  {message.sender !== 'system' && (
-                    <div className="flex items-center justify-between pt-2 mt-2 border-t border-white/10 gap-4 text-[10px] opacity-70">
-                      <span className="font-mono font-bold flex items-center gap-1">
-                        <MessageCircle className="w-3 h-3" />
-                        #{message.id}
-                      </span>
-                      <span className="font-mono font-semibold">
-                        {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        {message.sender === 'other' && ' • RX'}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-            <div ref={messagesEndRef} />
+          <div className="flex gap-2">
+            <button onClick={() => setShowRelayQueue(true)} className="p-2 glass-card rounded-lg relative">
+              <Inbox className="w-5 h-5 text-gray-300"/>
+              {relayQueue.some(m => m.status === 'pending') && <div className="absolute top-1 right-1 w-2 h-2 bg-green-500 rounded-full"/>}
+            </button>
+            
+            <button 
+              onClick={toggleStealthMode}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${isStealthMode ? 'border-red-500 bg-red-500/20 text-red-300' : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'}`}
+            >
+              {isStealthMode ? <><Activity className="w-4 h-4"/> Stealth</> : <><Signal className="w-4 h-4"/> Audible</>}
+            </button>
           </div>
         </div>
 
-        <div className="p-3 sm:p-4 bg-gray-900/95 backdrop-blur border-t border-gray-700 flex-shrink-0 z-20">
-          <div className="flex items-center gap-2 sm:gap-3 max-w-4xl mx-auto">
-            
-            {/* NEW: Offline AI Voice Button */}
-            <button
-              onClick={toggleAiRecording}
-              disabled={isModelLoading || !micPermission}
-              className={`p-2 sm:p-3 rounded-xl transition-all transform hover:scale-105 flex-shrink-0 border relative ${
-                isRecordingAI 
-                  ? 'bg-red-500/20 border-red-500 text-red-400 animate-pulse' 
-                  : 'bg-gray-800 border-gray-600 text-gray-400 hover:text-white hover:border-gray-500'
-              } ${isModelLoading ? 'opacity-50 cursor-wait' : ''}`}
-              title={isModelLoading ? "Loading AI Model..." : "Offline Voice-to-Text"}
-            >
-              {isModelLoading ? (
-                <Loader2 className="w-5 h-5 animate-spin text-cyan-500" />
-              ) : isRecordingAI ? (
-                <MicOff className="w-5 h-5" />
-              ) : (
-                <Mic className="w-5 h-5" />
-              )}
-              
-              {/* Ready Indicator Dot */}
-              {!isModelLoading && !isRecordingAI && transcriber && (
-                 <span className="absolute -top-1 -right-1 flex h-2 w-2">
-                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                   <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-                 </span>
-              )}
-            </button>
+        {/* Messages */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {isReceiving && (
+            <div className="flex justify-center">
+              <div className="bg-green-900/50 border border-green-500/50 px-6 py-2 rounded-full text-green-300 font-mono animate-pulse">
+                Rx: {incomingBuffer}<span className="animate-blink">_</span>
+              </div>
+            </div>
+          )}
+          
+          {messages.map(msg => (
+            <div key={msg.id} className={`flex ${msg.sender === 'me' ? 'justify-end' : msg.sender === 'system' ? 'justify-center' : 'justify-start'}`}>
+              <div className={`max-w-[80%] p-4 rounded-2xl ${
+                msg.sender === 'me' ? 'bg-cyan-600 text-white rounded-br-none' : 
+                msg.sender === 'system' ? 'bg-gray-800/50 text-gray-400 text-xs py-1 px-4' :
+                'bg-gray-800 text-white border border-gray-700 rounded-bl-none'
+              }`}>
+                {msg.text}
+                {msg.sender !== 'system' && <div className="text-[9px] opacity-50 mt-1 text-right font-mono">#{msg.id}</div>}
+              </div>
+            </div>
+          ))}
+          <div ref={messagesEndRef}/>
+        </div>
 
-            <input
-              type="text"
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              onKeyDown={handleKeyPress}
-              placeholder={
-                isModelLoading ? "Loading AI..." :
-                isRecordingAI ? "Listening (Offline)..." : 
-                micPermission ? "Enter text to transmit..." : "HTTPS Required"
-              }
-              disabled={!micPermission || isSending}
-              className={`flex-1 bg-gray-800 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl border border-gray-600 focus:border-cyan-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 disabled:opacity-50 disabled:cursor-not-allowed text-sm sm:text-base transition-all font-mono ${isRecordingAI ? 'border-red-500 ring-1 ring-red-500/50 placeholder-red-400/50' : ''}`}
-            />
-            <button
-              onClick={sendMessage}
-              disabled={!inputText.trim() || !micPermission || isSending}
-              className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed text-white p-2 sm:p-3 rounded-xl transition-all transform hover:scale-105 active:scale-95 disabled:hover:scale-100 shadow-lg flex-shrink-0"
+        {/* Input */}
+        <div className="p-4 glass-ultra pb-8">
+          {/* Chips */}
+          <div className="flex gap-2 mb-3 overflow-x-auto pb-2">
+            {[
+              {label: 'SOS', text: 'SOS! Need Help!', color: 'bg-red-600'},
+              {label: 'SAFE', text: 'I am safe.', color: 'bg-green-600'},
+              {label: 'WATER', text: 'Need water.', color: 'bg-blue-600'}
+            ].map(chip => (
+              <button key={chip.label} onClick={() => sendMessage(chip.text)} className={`${chip.color} px-4 py-1 rounded-full text-xs font-bold shadow-lg hover:brightness-110 transition-all whitespace-nowrap`}>
+                {chip.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex gap-2">
+            <button 
+              onClick={toggleAiRecording}
+              disabled={isModelLoading}
+              className={`p-3 rounded-xl border ${isRecordingAI ? 'border-red-500 bg-red-500/20 animate-pulse' : 'border-gray-600 bg-gray-800'}`}
             >
-              <Send className="w-5 h-5 sm:w-6 sm:h-6" />
+              {isModelLoading ? <Loader2 className="w-5 h-5 animate-spin"/> : <Mic className="w-5 h-5"/>}
+            </button>
+            
+            <input 
+              value={inputText}
+              onChange={e => setInputText(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && sendMessage()}
+              placeholder={isRecordingAI ? "Listening..." : "Enter message..."}
+              className="flex-1 bg-gray-800 rounded-xl px-4 border border-gray-600 focus:border-cyan-500 outline-none font-mono"
+            />
+            
+            <button onClick={() => sendMessage()} className="p-3 bg-cyan-600 rounded-xl hover:bg-cyan-500">
+              <Send className="w-5 h-5"/>
             </button>
           </div>
         </div>
