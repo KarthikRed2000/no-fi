@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock } from 'lucide-react';
+import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock, Loader2 } from 'lucide-react';
+// import { pipeline } from '@xenova/transformers';
 
 interface Message {
   id: number;
@@ -54,6 +55,62 @@ const NoFiChat: React.FC = () => {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+
+  // -- OFFLINE AI STATE --
+  // const [transcriber, setTranscriber] = useState<any>(null);
+  // const [isModelLoading, setIsModelLoading] = useState<boolean>(false);
+  // ... inside NoFiChat component ...
+
+  // -- OFFLINE AI STATE --
+  const [transcriber, setTranscriber] = useState<any>(null);
+  const [isModelLoading, setIsModelLoading] = useState<boolean>(true); // Start true to load immediately
+  const [isRecordingAI, setIsRecordingAI] = useState<boolean>(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+
+  // 1. Load the Model on Startup (One time)
+  // useEffect(() => {
+  //   const loadModel = async () => {
+  //     setIsModelLoading(true);
+  //     try {
+  //       // 'task' is automatic-speech-recognition
+  //       // 'model' is the quantized tiny version (small and fast)
+  //       const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
+  //       setTranscriber(() => pipe); // Store function in state
+  //       addLog("Offline AI Voice Model Loaded", "success");
+  //     } catch (err) {
+  //       console.error(err);
+  //       addLog("Failed to load Offline AI", "error");
+  //     }
+  //     setIsModelLoading(false);
+  //   };
+    
+  //   // Trigger load only if user wants voice features (or auto-load)
+  //   // For hackathon, maybe put a "Load Voice AI" button to save initial bandwidth
+  //   // loadModel(); 
+  // }, []);
+
+  // // 2. Function to Transcribe Audio Blob
+  // const transcribeAudio = async (audioBlob: Blob) => {
+  //   if (!transcriber) {
+  //       alert("AI Model not loaded yet!");
+  //       return;
+  //   }
+    
+  //   setIsDictating(true);
+    
+  //   // Convert Blob to URL for the model
+  //   const url = URL.createObjectURL(audioBlob);
+    
+  //   try {
+  //       const result = await transcriber(url);
+  //       setInputText(prev => prev + " " + result.text);
+  //   } catch (e) {
+  //       console.error(e);
+  //   }
+    
+  //   setIsDictating(false);
+  // };
 
   // Decoder State
   const decoderRef = useRef({
@@ -358,6 +415,102 @@ const NoFiChat: React.FC = () => {
     };
   }, []);
 
+  // 1. LOAD WHISPER MODEL (Runs once on mount)
+  // 1. LOAD WHISPER MODEL
+  useEffect(() => {
+    const loadModel = async () => {
+      try {
+        addLog("Loading AI engine...", "info");
+        
+        // --- THE FIX: Load from CDN to bypass Vite bundling errors ---
+        // @ts-ignore
+        const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
+        
+        // Configure to allow local models if cached, or fetch from remote
+        env.allowLocalModels = false; 
+        
+        // Load the model
+        addLog("Downloading model weights (~40MB)...", "info");
+        const pipe = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en');
+        
+        setTranscriber(() => pipe); 
+        setIsModelLoading(false);
+        addLog("Offline AI Ready! (WiFi can now be turned off)", "success");
+        // -------------------------------------------------------------
+
+      } catch (err) {
+        console.error(err);
+        setIsModelLoading(false);
+        addLog("AI Load Failed. Check Internet connection for first run.", "error");
+      }
+    };
+    loadModel();
+  }, []);
+
+  // 2. TRANSCRIBE AUDIO (The "Brain")
+  const transcribeAudio = async (audioBlob: Blob) => {
+    if (!transcriber) return;
+    
+    addLog("Processing speech locally...", "info");
+    
+    // Create a URL for the blob so the model can read it
+    const url = URL.createObjectURL(audioBlob);
+    
+    try {
+        const result = await transcriber(url);
+        // Append result to input text
+        setInputText(prev => (prev + " " + result.text).trim());
+    } catch (e) {
+        console.error(e);
+        addLog("Transcription failed", "error");
+    }
+  };
+
+  // 3. HANDLE RECORDING (The "Ears")
+  const toggleAiRecording = async () => {
+    // A. If currently recording, STOP it.
+    if (isRecordingAI && mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+        setIsRecordingAI(false);
+        return;
+    }
+
+    // B. If NOT recording, START it.
+    if (!transcriber) {
+        addLog("AI Model is still loading...", "error");
+        return;
+    }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mediaRecorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = mediaRecorder;
+        chunksRef.current = []; // Reset chunks
+
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                chunksRef.current.push(event.data);
+            }
+        };
+
+        mediaRecorder.onstop = () => {
+            const audioBlob = new Blob(chunksRef.current, { type: 'audio/wav' });
+            transcribeAudio(audioBlob);
+            
+            // Stop all tracks to release mic
+            stream.getTracks().forEach(track => track.stop());
+        };
+
+        mediaRecorder.start();
+        setIsRecordingAI(true);
+        addLog("Listening... (Click Mic to stop)", "info");
+
+    } catch (err) {
+        console.error(err);
+        addLog("Could not access microphone for AI", "error");
+    }
+  };
+
   const sendMessage = (): void => {
     if (!inputText.trim() || !micPermission || isSending) return;
     
@@ -601,14 +754,47 @@ const NoFiChat: React.FC = () => {
         {/* Input Area */}
         <div className="p-3 sm:p-4 bg-gray-900/95 backdrop-blur border-t border-gray-700 flex-shrink-0 z-20">
           <div className="flex items-center gap-2 sm:gap-3 max-w-4xl mx-auto">
+            
+            {/* NEW: Offline AI Voice Button */}
+            <button
+              onClick={toggleAiRecording}
+              disabled={isModelLoading || !micPermission}
+              className={`p-2 sm:p-3 rounded-xl transition-all transform hover:scale-105 flex-shrink-0 border relative ${
+                isRecordingAI 
+                  ? 'bg-red-500/20 border-red-500 text-red-400 animate-pulse' 
+                  : 'bg-gray-800 border-gray-600 text-gray-400 hover:text-white hover:border-gray-500'
+              } ${isModelLoading ? 'opacity-50 cursor-wait' : ''}`}
+              title={isModelLoading ? "Loading AI Model..." : "Offline Voice-to-Text"}
+            >
+              {isModelLoading ? (
+                <Loader2 className="w-5 h-5 animate-spin text-cyan-500" />
+              ) : isRecordingAI ? (
+                <MicOff className="w-5 h-5" />
+              ) : (
+                <Mic className="w-5 h-5" />
+              )}
+              
+              {/* Ready Indicator Dot */}
+              {!isModelLoading && !isRecordingAI && transcriber && (
+                 <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                   <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                 </span>
+              )}
+            </button>
+
             <input
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              onKeyPress={handleKeyPress}
-              placeholder={micPermission ? "Enter text to transmit..." : isSecureContext ? "Enable microphone first" : "HTTPS Required"}
+              onKeyDown={handleKeyPress}
+              placeholder={
+                isModelLoading ? "Loading AI..." :
+                isRecordingAI ? "Listening (Offline)..." : 
+                micPermission ? "Enter text to transmit..." : "HTTPS Required"
+              }
               disabled={!micPermission || isSending}
-              className="flex-1 bg-gray-800 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl border border-gray-600 focus:border-cyan-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 disabled:opacity-50 disabled:cursor-not-allowed text-sm sm:text-base transition-all font-mono"
+              className={`flex-1 bg-gray-800 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl border border-gray-600 focus:border-cyan-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 disabled:opacity-50 disabled:cursor-not-allowed text-sm sm:text-base transition-all font-mono ${isRecordingAI ? 'border-red-500 ring-1 ring-red-500/50 placeholder-red-400/50' : ''}`}
             />
             <button
               onClick={sendMessage}
