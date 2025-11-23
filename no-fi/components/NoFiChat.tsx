@@ -20,6 +20,7 @@ interface RelayMessage {
   text: string;
   receivedAt: Date;
   status: 'pending' | 'relayed';
+  relayAfter: number; // Random delay in milliseconds (10-20 seconds)
 }
 
 // -- AUDIO PROTOCOL CONSTANTS --
@@ -136,6 +137,52 @@ const NoFiChat: React.FC = () => {
 
   // -- HELPER: Generate Short ID --
   const generateId = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+
+  // -- AUTO-RELAY EFFECT --
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      
+      setRelayQueue(prev => {
+        // Don't auto-relay while receiving or sending - just wait
+        if (isSendingRef.current || isReceiving) {
+          return prev; // Wait, don't skip - timer keeps running
+        }
+        
+        // Find messages that are pending and past their random relay time
+        const toRelay = prev.filter(msg => 
+          msg.status === 'pending' && 
+          (now - msg.receivedAt.getTime()) >= msg.relayAfter
+        );
+        
+        // Auto-relay the first pending message that's ready
+        if (toRelay.length > 0) {
+          const msg = toRelay[0];
+          
+          setIsSending(true);
+          isSendingRef.current = true;
+          
+          const payload = `${msg.id}${PROTOCOL.SEPARATOR}${msg.text}`;
+          addLog(`Auto-relaying: #${msg.id}`, 'info');
+          
+          transmitAudio(payload, () => {
+            setIsSending(false);
+            setTimeout(() => { isSendingRef.current = false; }, 500);
+            
+            setRelayQueue(queue => queue.map(m => 
+              m.id === msg.id ? { ...m, status: 'relayed' as const } : m
+            ));
+            
+            addLog(`Auto-relayed: #${msg.id}`, 'success');
+          });
+        }
+        
+        return prev;
+      });
+    }, 1000); // Check every second
+    
+    return () => clearInterval(interval);
+  }, [isReceiving]); // Add isReceiving as dependency
 
   // -- SYSTEM CHECKS --
   useEffect(() => {
@@ -428,16 +475,18 @@ const NoFiChat: React.FC = () => {
         // Add to messages (persist in chat)
         setMessages(prev => [...prev, newMessage]);
         
-        // Add to relay queue
+        // Add to relay queue with random delay between 10-20 seconds
+        const randomDelay = 10000 + Math.random() * 10000; // 10000ms to 20000ms
         const relayMessage: RelayMessage = {
           id: msgId,
           text: msgText,
           receivedAt: new Date(),
-          status: 'pending'
+          status: 'pending',
+          relayAfter: randomDelay
         };
         setRelayQueue(prev => [...prev, relayMessage]);
         
-        addLog(`RX: #${msgId}`, 'success');
+        addLog(`RX: #${msgId} (relay in ${Math.round(randomDelay/1000)}s)`, 'success');
       }
     }
     
