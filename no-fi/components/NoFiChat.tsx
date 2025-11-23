@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock, Loader2, Inbox } from 'lucide-react';
+import { Send, Mic, MicOff, Signal, WifiOff, Activity, Lock, Loader2, Inbox } from 'lucide-react';
 // import { pipeline } from '@xenova/transformers';
 import { X, Zap, Radio, Waves, MessageCircle } from 'lucide-react';
 
