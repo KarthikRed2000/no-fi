@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock, Loader2 } from 'lucide-react';
+import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock, Loader2, Inbox } from 'lucide-react';
 // import { pipeline } from '@xenova/transformers';
 
 interface Message {
-  id: number;
+  id: string;
   text: string;
   sender: 'me' | 'other' | 'system';
   timestamp: Date;
@@ -15,22 +15,30 @@ interface Log {
   timestamp: string;
 }
 
+interface RelayMessage {
+  id: string;
+  text: string;
+  receivedAt: Date;
+  status: 'pending' | 'relayed';
+}
+
 // -- AUDIO PROTOCOL CONSTANTS --
-// Simple Frequency Shift Keying (FSK) / Marker-based protocol
 const PROTOCOL = {
-  MARKER_FREQ: 1200,      // Signal start/separator tone (Hz)
-  BASE_FREQ: 1500,        // Starting frequency for data (Hz)
-  STEP_FREQ: 40,          // Hz per ASCII code
-  TONE_DURATION: 0.08,    // Duration of each tone (seconds)
-  GAP_DURATION: 0.02,     // Silence between tones
+  MARKER_FREQ: 1200,      
+  BASE_FREQ: 1500,        
+  STEP_FREQ: 40,          
+  TONE_DURATION: 0.08,    
+  GAP_DURATION: 0.02,     
   FFT_SIZE: 2048,
-  THRESHOLD: 30,          // Min decibel level to detect
-  SILENCE_TIMEOUT: 1500,  // Time to wait before considering message complete (ms)
+  THRESHOLD: 30,          
+  SILENCE_TIMEOUT: 1500,
+  IDLE_TIMEOUT: 3000,
+  SEPARATOR: '|'
 };
 
 const NoFiChat: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([
-    { id: 1, text: "Welcome to NoFi! Messages are now transmitted via REAL audio tones.", sender: "system", timestamp: new Date() }
+    { id: "SYS1", text: "NoFi Chat initialized. Received messages will display on left and be stored in relay queue.", sender: "system", timestamp: new Date() }
   ]);
   const [inputText, setInputText] = useState<string>('');
   const [logs, setLogs] = useState<Log[]>([]);
@@ -38,14 +46,14 @@ const NoFiChat: React.FC = () => {
   const [micPermission, setMicPermission] = useState<boolean>(false);
   const [isSecureContext, setIsSecureContext] = useState<boolean>(true);
   
+  // Relay Queue
+  const [relayQueue, setRelayQueue] = useState<RelayMessage[]>([]);
+  const [showRelayQueue, setShowRelayQueue] = useState<boolean>(false);
+  
   // Transmission States
   const [isSending, setIsSending] = useState<boolean>(false);
   const [isReceiving, setIsReceiving] = useState<boolean>(false);
   const [incomingBuffer, setIncomingBuffer] = useState<string>('');
-  
-  // Background Process States
-  const [isRelaying, setIsRelaying] = useState<boolean>(false);
-  const [relayCount, setRelayCount] = useState<number>(0);
   
   const [signalStrength, setSignalStrength] = useState<number>(0);
   const [audioLevel, setAudioLevel] = useState<number>(0);
@@ -111,6 +119,8 @@ const NoFiChat: React.FC = () => {
     
   //   setIsDictating(false);
   // };
+  const isSendingRef = useRef<boolean>(false);
+  const seenIdsRef = useRef<Set<string>>(new Set(["SYS1"]));
 
   // Decoder State
   const decoderRef = useRef({
@@ -118,13 +128,17 @@ const NoFiChat: React.FC = () => {
     buffer: '',
     lastDetectedChar: null as string | null,
     silenceTimer: null as number | null,
+    lastValidRead: Date.now(),
+    lastCharDecoded: Date.now(),
     consecutiveFrames: 0,
     lastFreqIndex: 0
   });
 
-  // -- SYSTEM CHECKS (Tailwind & HTTPS) --
+  // -- HELPER: Generate Short ID --
+  const generateId = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+
+  // -- SYSTEM CHECKS --
   useEffect(() => {
-    // 1. Inject Tailwind CSS
     if (!document.querySelector('script[src*="tailwindcss"]')) {
       const script = document.createElement('script');
       script.src = "https://cdn.tailwindcss.com";
@@ -132,25 +146,20 @@ const NoFiChat: React.FC = () => {
       document.head.appendChild(script);
     }
 
-    // 2. Enforce HTTPS (Required for Microphone Access)
-    // Browsers block getUserMedia on insecure origins (except localhost)
     if (
       window.location.protocol === 'http:' && 
       window.location.hostname !== 'localhost' && 
       window.location.hostname !== '127.0.0.1'
     ) {
-      console.warn("NoFi requires a Secure Context. Redirecting to HTTPS...");
       window.location.href = window.location.href.replace(/^http:/, 'https:');
     }
     
-    // Check if we are actually in a secure context (updates UI if failed)
     if (!window.isSecureContext) {
       setIsSecureContext(false);
       addLog('Error: App must run via HTTPS', 'error');
     }
   }, []);
 
-  // Auto-scroll to bottom
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
@@ -158,29 +167,6 @@ const NoFiChat: React.FC = () => {
   useEffect(() => {
     scrollToBottom();
   }, [messages, incomingBuffer]);
-
-  // Background Process: Relay Logic
-  useEffect(() => {
-    const lastMessage = messages[messages.length - 1];
-
-    if (lastMessage && lastMessage.sender === 'other') {
-      const processingDelay = Math.random() * 2000 + 1000;
-
-      const timer = setTimeout(() => {
-        setIsRelaying(true);
-        addLog('Background: Relaying signal...', 'info');
-        
-        transmitAudio(lastMessage.text, () => {
-          setIsRelaying(false);
-          setRelayCount(prev => prev + 1);
-          addLog(`Background: Packet relayed`, 'success');
-        });
-
-      }, processingDelay);
-
-      return () => clearTimeout(timer);
-    }
-  }, [messages]);
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info'): void => {
     const logEntry: Log = { message, type, timestamp: new Date().toLocaleTimeString() };
@@ -194,7 +180,6 @@ const NoFiChat: React.FC = () => {
     }
 
     try {
-      // We need echo cancellation OFF for better raw frequency detection
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: { 
           echoCancellation: false, 
@@ -226,10 +211,13 @@ const NoFiChat: React.FC = () => {
   };
 
   // -- TRANSMITTER --
-  const transmitAudio = (text: string, onComplete?: () => void) => {
+  const transmitAudio = (payload: string, onComplete?: () => void) => {
     if (!audioContextRef.current) return;
     
     const ctx = audioContextRef.current;
+    
+    if (ctx.state === 'suspended') ctx.resume();
+
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
@@ -237,30 +225,25 @@ const NoFiChat: React.FC = () => {
     osc.connect(gain);
     gain.connect(ctx.destination);
 
-    // Initial padding
     gain.gain.setValueAtTime(0, now);
-    
     let startTime = now + 0.1;
 
-    // Encode text
-    for (let i = 0; i < text.length; i++) {
-      const charCode = text.charCodeAt(i);
+    for (let i = 0; i < payload.length; i++) {
+      const charCode = payload.charCodeAt(i);
       const freq = PROTOCOL.BASE_FREQ + (charCode * PROTOCOL.STEP_FREQ);
 
-      // 1. Play Marker
+      // 1. Marker
       osc.frequency.setValueAtTime(PROTOCOL.MARKER_FREQ, startTime);
       gain.gain.setValueAtTime(0.5, startTime);
       gain.gain.setValueAtTime(0.5, startTime + PROTOCOL.TONE_DURATION);
       gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.005); 
-
       startTime += PROTOCOL.TONE_DURATION + PROTOCOL.GAP_DURATION;
 
-      // 2. Play Data Tone
+      // 2. Data Tone
       osc.frequency.setValueAtTime(freq, startTime);
       gain.gain.setValueAtTime(0.5, startTime);
       gain.gain.setValueAtTime(0.5, startTime + PROTOCOL.TONE_DURATION);
       gain.gain.linearRampToValueAtTime(0, startTime + PROTOCOL.TONE_DURATION + 0.005);
-
       startTime += PROTOCOL.TONE_DURATION + PROTOCOL.GAP_DURATION;
     }
 
@@ -287,7 +270,6 @@ const NoFiChat: React.FC = () => {
       
       analyserRef.current.getByteFrequencyData(dataArray);
       
-      // 1. Visualization Levels
       let sum = 0;
       let maxVal = 0;
       let maxIndex = 0;
@@ -302,16 +284,19 @@ const NoFiChat: React.FC = () => {
       }
       
       const average = sum / bufferLength;
-      setAudioLevel(Math.min(100, (average / 50) * 100)); // Visual only
+      setAudioLevel(Math.min(100, (average / 50) * 100));
       setSignalStrength(Math.floor(Math.min(100, (maxVal / 255) * 100)));
 
-      // 2. Decoding Logic
-      if (maxVal > PROTOCOL.THRESHOLD) {
-        const nyquist = ctx.sampleRate / 2;
-        const dominantFreq = (maxIndex / bufferLength) * nyquist;
-        handleFrequencyInput(dominantFreq, maxVal);
+      if (!isSendingRef.current) {
+        if (maxVal > PROTOCOL.THRESHOLD) {
+          const nyquist = ctx.sampleRate / 2;
+          const dominantFreq = (maxIndex / bufferLength) * nyquist;
+          handleFrequencyInput(dominantFreq, maxVal);
+        } else {
+          handleFrequencyInput(0, 0);
+        }
       } else {
-        handleFrequencyInput(0, 0);
+        decoderRef.current.consecutiveFrames = 0;
       }
       
       animationFrameRef.current = requestAnimationFrame(update);
@@ -325,38 +310,64 @@ const NoFiChat: React.FC = () => {
     const d = decoderRef.current;
     const now = Date.now();
 
-    // Check for silence timeout to commit message
-    if (d.buffer.length > 0 && d.silenceTimer && (now - d.silenceTimer > PROTOCOL.SILENCE_TIMEOUT)) {
+    // NO PROGRESS TIMEOUT - If we have data but haven't decoded a new char in 3 seconds, commit and reset
+    if (d.buffer.length > 0 && (now - d.lastCharDecoded > 3000)) {
+      addLog('No new char for 3s - committing', 'info');
       commitReceivedMessage();
       return;
     }
 
-    if (amplitude < PROTOCOL.THRESHOLD) {
-      d.consecutiveFrames = 0;
+    // SILENCE TIMEOUT - Check after no-progress timeout
+    if (d.buffer.length > 0 && d.silenceTimer !== null && (now - d.silenceTimer > PROTOCOL.SILENCE_TIMEOUT)) {
+      commitReceivedMessage();
       return;
     }
 
-    // Reset silence timer on any strong signal
-    if (d.buffer.length > 0) {
-      d.silenceTimer = now;
+    // IDLE TIMEOUT - only reset if no data received
+    if (d.state !== 'IDLE' && d.buffer.length === 0 && (now - d.lastValidRead > PROTOCOL.IDLE_TIMEOUT)) {
+      d.state = 'IDLE';
+      d.buffer = '';
+      d.lastDetectedChar = null;
+      d.consecutiveFrames = 0;
+      setIncomingBuffer('');
+      setIsReceiving(false);
+      addLog('Signal lost (timeout)', 'info');
+      return;
     }
 
-    // Frequency Matching Helper
+    // Handle silence - start timer when signal drops
+    if (amplitude < PROTOCOL.THRESHOLD) {
+      d.consecutiveFrames = 0;
+      // Start silence timer only once when we first detect silence with data
+      if (d.buffer.length > 0 && d.silenceTimer === null) {
+        d.silenceTimer = now;
+      }
+      return;
+    }
+
+    // We have a signal - reset silence timer (still receiving)
+    if (d.buffer.length > 0 && d.silenceTimer !== null) {
+      d.silenceTimer = null;
+    }
+
     const isFreq = (target: number, range = 50) => Math.abs(freq - target) < range;
 
-    // State Machine
     if (d.state === 'IDLE' || d.state === 'WAIT_MARKER') {
       if (isFreq(PROTOCOL.MARKER_FREQ)) {
         d.consecutiveFrames++;
-        if (d.consecutiveFrames > 2) { // Debounce
+        if (d.consecutiveFrames > 2) { 
           d.state = 'READ_CHAR';
           d.consecutiveFrames = 0;
+          d.lastDetectedChar = null; // Reset to detect next char
+          d.lastValidRead = now;
           if (!isReceiving) setIsReceiving(true);
         }
+      } else {
+        // Reset consecutive frames if we don't detect marker
+        d.consecutiveFrames = 0;
       }
     } 
     else if (d.state === 'READ_CHAR') {
-      // Identify character frequency
       if (!isFreq(PROTOCOL.MARKER_FREQ)) {
         const estimatedChar = Math.round((freq - PROTOCOL.BASE_FREQ) / PROTOCOL.STEP_FREQ);
         
@@ -368,13 +379,17 @@ const NoFiChat: React.FC = () => {
              
              if (char !== d.lastDetectedChar) {
                d.buffer += char;
-               setIncomingBuffer(d.buffer); // Update UI
+               setIncomingBuffer(d.buffer);
                d.lastDetectedChar = char;
+               d.lastCharDecoded = now; // Update timestamp when char is decoded
                d.state = 'WAIT_MARKER'; 
                d.consecutiveFrames = 0;
-               d.silenceTimer = now;
+               d.lastValidRead = now;
              }
            }
+        } else {
+          // Invalid character - reset and wait for marker
+          d.consecutiveFrames = 0;
         }
       } else {
          d.consecutiveFrames = 0;
@@ -384,29 +399,57 @@ const NoFiChat: React.FC = () => {
 
   const commitReceivedMessage = () => {
     const d = decoderRef.current;
+    const rawData = d.buffer.trim();
     
-    if (d.buffer.trim().length > 0) {
-      const newMessage: Message = {
-        id: Date.now(),
-        text: d.buffer,
-        sender: 'other',
-        timestamp: new Date()
-      };
-      
-      setMessages(prev => [...prev, newMessage]);
-      addLog('Message received via audio', 'success');
+    if (rawData.length > 0) {
+      let msgId = generateId();
+      let msgText = rawData;
+
+      if (rawData.includes(PROTOCOL.SEPARATOR)) {
+        const parts = rawData.split(PROTOCOL.SEPARATOR);
+        if (parts.length >= 2) {
+          msgId = parts[0];
+          msgText = parts.slice(1).join(PROTOCOL.SEPARATOR);
+        }
+      }
+
+      if (seenIdsRef.current.has(msgId)) {
+        addLog(`Ignored duplicate #${msgId}`, 'info');
+      } else {
+        seenIdsRef.current.add(msgId);
+        
+        const newMessage: Message = {
+          id: msgId,
+          text: msgText,
+          sender: 'other',
+          timestamp: new Date()
+        };
+        
+        // Add to messages (persist in chat)
+        setMessages(prev => [...prev, newMessage]);
+        
+        // Add to relay queue
+        const relayMessage: RelayMessage = {
+          id: msgId,
+          text: msgText,
+          receivedAt: new Date(),
+          status: 'pending'
+        };
+        setRelayQueue(prev => [...prev, relayMessage]);
+        
+        addLog(`RX: #${msgId}`, 'success');
+      }
     }
     
-    // Reset Decoder
     d.buffer = '';
     d.lastDetectedChar = null;
     d.state = 'IDLE';
     d.silenceTimer = null;
+    d.lastCharDecoded = Date.now(); // Reset the no-progress timer
     setIncomingBuffer('');
     setIsReceiving(false);
   };
 
-  // Cleanup
   useEffect(() => {
     return () => {
       if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
@@ -514,24 +557,57 @@ const NoFiChat: React.FC = () => {
   const sendMessage = (): void => {
     if (!inputText.trim() || !micPermission || isSending) return;
     
+    const newId = generateId();
+    seenIdsRef.current.add(newId);
+
     const newMessage: Message = {
-      id: Date.now(),
+      id: newId,
       text: inputText,
       sender: 'me',
       timestamp: new Date()
     };
     
     setMessages(prev => [...prev, newMessage]);
-    const textToSend = inputText;
+    const payload = `${newId}${PROTOCOL.SEPARATOR}${inputText}`;
     setInputText('');
     
     setIsSending(true);
-    addLog('Transmitting audio data...', 'info');
+    isSendingRef.current = true;
     
-    transmitAudio(textToSend, () => {
+    addLog(`TX: #${newId}`, 'info');
+    
+    transmitAudio(payload, () => {
       setIsSending(false);
+      setTimeout(() => { isSendingRef.current = false; }, 500);
       addLog('Transmission complete', 'success');
     });
+  };
+
+  const relayMessage = (msgId: string): void => {
+    const message = relayQueue.find(m => m.id === msgId);
+    if (!message || message.status === 'relayed') return;
+    
+    setIsSending(true);
+    isSendingRef.current = true;
+    
+    const payload = `${message.id}${PROTOCOL.SEPARATOR}${message.text}`;
+    addLog(`Relaying: #${msgId}`, 'info');
+    
+    transmitAudio(payload, () => {
+      setIsSending(false);
+      setTimeout(() => { isSendingRef.current = false; }, 500);
+      
+      setRelayQueue(prev => prev.map(m => 
+        m.id === msgId ? { ...m, status: 'relayed' as const } : m
+      ));
+      
+      addLog(`Relayed: #${msgId}`, 'success');
+    });
+  };
+
+  const clearRelayQueue = (): void => {
+    setRelayQueue([]);
+    addLog('Relay queue cleared', 'info');
   };
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>): void => {
@@ -551,9 +627,6 @@ const NoFiChat: React.FC = () => {
         .animate-fadeIn {
           animation: fadeIn 0.3s ease-out forwards;
         }
-        /* Visualizer Bars */
-        .eq-bar { animation: eq 0.5s infinite ease-in-out alternate; }
-        @keyframes eq { 0% { height: 20%; } 100% { height: 100%; } }
       `}</style>
 
       {/* Onboarding Modal */}
@@ -574,29 +647,17 @@ const NoFiChat: React.FC = () => {
             </h2>
             
             <p className="text-gray-300 text-center mb-6">
-              This version uses <strong>actual sound waves</strong> to transmit data. Ensure your volume is up and microphone is enabled.
+              Audio-based messaging with <strong>relay queue</strong> and <strong>persistent messages</strong>.
             </p>
 
-            {/* Secure Context Warning */}
             {!isSecureContext && (
               <div className="bg-red-900 bg-opacity-50 border border-red-500 rounded-lg p-3 mb-4 text-sm text-red-200 flex items-start gap-2">
                 <Lock className="w-5 h-5 flex-shrink-0 mt-0.5" />
                 <div>
-                  <strong>Security Alert:</strong> This app requires HTTPS to access the microphone.
-                  <br />
-                  <span className="text-xs opacity-75">If you are running this locally, use localhost. If deployed, ensure SSL is enabled.</span>
+                  <strong>Security Alert:</strong> HTTPS Required.
                 </div>
               </div>
             )}
-            
-            <div className="bg-yellow-900 bg-opacity-30 border border-yellow-600 rounded-lg p-4 mb-6">
-              <p className="text-sm text-yellow-200 flex gap-2">
-                <Activity className="w-5 h-5 flex-shrink-0" />
-                <span>
-                  <strong>Warning:</strong> Produces high-pitched tones. Do not use if sensitive to loud noises.
-                </span>
-              </p>
-            </div>
             
             <button
               onClick={requestMicPermission}
@@ -606,6 +667,80 @@ const NoFiChat: React.FC = () => {
               <Mic className="w-5 h-5" />
               {isSecureContext ? 'Initialize Modem' : 'HTTPS Required'}
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Relay Queue Panel */}
+      {showRelayQueue && (
+        <div className="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center z-50 backdrop-blur-sm p-4">
+          <div className="bg-gradient-to-br from-gray-800 to-gray-900 p-6 rounded-2xl shadow-2xl w-full max-w-2xl border border-green-500 max-h-[80vh] flex flex-col">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-2xl font-bold text-green-400 flex items-center gap-2">
+                <Inbox className="w-6 h-6" />
+                Relay Queue
+              </h2>
+              <button
+                onClick={() => setShowRelayQueue(false)}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto space-y-2 mb-4">
+              {relayQueue.length === 0 ? (
+                <div className="text-center text-gray-400 py-8">
+                  No messages in relay queue
+                </div>
+              ) : (
+                relayQueue.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className={`p-4 rounded-lg border ${
+                      msg.status === 'relayed' 
+                        ? 'bg-gray-700/50 border-gray-600' 
+                        : 'bg-green-900/30 border-green-500/50'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex-1">
+                        <p className="text-white mb-2">{msg.text}</p>
+                        <div className="flex items-center gap-3 text-xs text-gray-400">
+                          <span className="font-mono">ID: {msg.id}</span>
+                          <span>{msg.receivedAt.toLocaleTimeString()}</span>
+                          <span className={`px-2 py-0.5 rounded ${
+                            msg.status === 'relayed' 
+                              ? 'bg-gray-600 text-gray-300' 
+                              : 'bg-green-600 text-green-100'
+                          }`}>
+                            {msg.status}
+                          </span>
+                        </div>
+                      </div>
+                      {msg.status === 'pending' && (
+                        <button
+                          onClick={() => relayMessage(msg.id)}
+                          disabled={isSending}
+                          className="bg-green-500 hover:bg-green-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm transition-all"
+                        >
+                          Relay
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            
+            {relayQueue.length > 0 && (
+              <button
+                onClick={clearRelayQueue}
+                className="w-full bg-red-500/20 hover:bg-red-500/30 border border-red-500 text-red-400 py-2 rounded-lg transition-all"
+              >
+                Clear Queue
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -629,29 +764,38 @@ const NoFiChat: React.FC = () => {
                     {isSecureContext ? 'Secure' : 'Not Secure'}
                   </span>
                 </h1>
-                <p className="text-xs text-blue-100 font-mono">MODEM: {isSending ? 'TX' : isReceiving ? 'RX' : 'IDLE'}</p>
+                <p className="text-xs text-blue-100 font-mono">{isSending ? 'TX: SENDING' : isReceiving ? 'RX: DECODING' : 'STATUS: IDLE'}</p>
               </div>
             </div>
 
-            {/* Relay Stats Badge */}
             {micPermission && (
               <div className="hidden md:flex items-center gap-2 bg-black/20 px-3 py-1 rounded-full border border-white/10 backdrop-blur-sm">
-                <Repeat className={`w-3 h-3 ${isRelaying ? 'text-amber-400 animate-spin' : 'text-gray-400'}`} />
                 <div className="text-xs flex gap-1">
-                  <span className="text-blue-100">Relayed:</span>
-                  <span className="text-amber-400 font-mono font-bold">{relayCount}</span>
+                  <span className="text-blue-100">Status:</span>
+                  <span className="text-green-400 font-mono font-bold">Active</span>
                 </div>
               </div>
             )}
           </div>
           
-          {/* Signal Meter */}
           <div className="flex items-center gap-3">
+            {/* Relay Queue Button */}
+            <button
+              onClick={() => setShowRelayQueue(true)}
+              className="relative bg-black/30 hover:bg-black/40 p-2 rounded-lg transition-all border border-white/20"
+            >
+              <Inbox className="w-5 h-5 text-white" />
+              {relayQueue.filter(m => m.status === 'pending').length > 0 && (
+                <span className="absolute -top-1 -right-1 bg-green-500 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center font-bold">
+                  {relayQueue.filter(m => m.status === 'pending').length}
+                </span>
+              )}
+            </button>
+            
             <div className="text-right hidden sm:block">
               <div className="text-xs text-blue-100">FREQ</div>
               <div className="text-sm font-bold text-white font-mono">{signalStrength > 10 ? 'DETECT' : 'LOW'}</div>
             </div>
-            {/* Visualizer */}
             <div className="w-24 sm:w-32 h-8 bg-black/40 rounded flex items-end justify-between px-1 pb-1 gap-0.5 border border-white/10">
               {[...Array(8)].map((_, i) => (
                 <div 
@@ -664,18 +808,12 @@ const NoFiChat: React.FC = () => {
                 />
               ))}
             </div>
-            {micPermission ? (
-              <Mic className={`w-6 h-6 ${isReceiving ? 'text-green-400 animate-pulse' : 'text-blue-300'}`} />
-            ) : (
-              <MicOff className="w-6 h-6 text-red-400" />
-            )}
           </div>
         </div>
 
         {/* Messages Area */}
         <div className="flex-1 relative overflow-hidden flex flex-col">
           
-          {/* Transmission Visuals */}
           {isSending && (
             <div className="absolute inset-0 pointer-events-none z-20 overflow-hidden">
               <div className="absolute inset-0 bg-blue-500 opacity-5 animate-pulse" />
@@ -683,24 +821,13 @@ const NoFiChat: React.FC = () => {
             </div>
           )}
 
-          {isRelaying && (
-            <div className="absolute inset-0 pointer-events-none z-20 overflow-hidden flex items-center justify-center">
-              <div className="bg-amber-500/10 absolute inset-0 animate-pulse" />
-              <div className="bg-black/80 text-amber-500 px-6 py-2 rounded-full border border-amber-500/50 backdrop-blur-md font-mono text-sm animate-bounce">
-                RE-BROADCASTING AUDIO...
-              </div>
-            </div>
-          )}
-
-          {/* Incoming Buffer Display (Real-time decoding) */}
           {isReceiving && (
              <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 bg-black/80 border border-green-500 px-6 py-3 rounded-xl z-30 flex flex-col items-center">
-                <span className="text-green-500 text-xs font-mono uppercase tracking-widest mb-1">Incoming Transmission</span>
+                <span className="text-green-500 text-xs font-mono uppercase tracking-widest mb-1">Decoding Audio Stream</span>
                 <span className="text-white font-mono text-lg min-h-[1.5rem]">{incomingBuffer}<span className="animate-pulse">_</span></span>
              </div>
           )}
 
-          {/* Logs */}
           {logs.length > 0 && (
             <div className="absolute top-4 right-4 bg-black bg-opacity-90 backdrop-blur-md p-3 rounded-lg border border-cyan-500 z-10 max-w-xs shadow-xl pointer-events-none">
               <div className="text-xs font-mono space-y-1">
@@ -721,10 +848,7 @@ const NoFiChat: React.FC = () => {
             </div>
           )}
 
-          {/* Scrollable Messages */}
-          <div 
-            className={`flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 pb-24`}
-          >
+          <div className={`flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 pb-24`}>
             {messages.map((message) => (
               <div
                 key={message.id}
@@ -740,10 +864,15 @@ const NoFiChat: React.FC = () => {
                   }`}
                 >
                   <p className="text-sm break-words leading-relaxed font-sans">{message.text}</p>
-                  <p className="text-[10px] opacity-70 mt-1 text-right font-mono">
-                    {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    {message.sender === 'other' && ' • RX'}
-                  </p>
+                  <div className="flex items-center justify-between mt-2 pt-2 border-t border-white/10 gap-4">
+                     <span className="text-[10px] font-mono opacity-50 tracking-wider">
+                        ID: {message.id}
+                     </span>
+                     <span className="text-[10px] opacity-70 font-mono">
+                        {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        {message.sender === 'other' && ' • RX'}
+                     </span>
+                  </div>
                 </div>
               </div>
             ))}
@@ -751,7 +880,6 @@ const NoFiChat: React.FC = () => {
           </div>
         </div>
 
-        {/* Input Area */}
         <div className="p-3 sm:p-4 bg-gray-900/95 backdrop-blur border-t border-gray-700 flex-shrink-0 z-20">
           <div className="flex items-center gap-2 sm:gap-3 max-w-4xl mx-auto">
             
