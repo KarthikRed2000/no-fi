@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, MicOff, Signal, WifiOff, Repeat, Activity, Lock, Loader2, Inbox, X, Zap, Radio, Waves, MessageCircle } from 'lucide-react';
+import { Send, Mic, Signal, WifiOff, Activity, Loader2, Inbox, X, Radio } from 'lucide-react';
 
 interface Message {
   id: string;
